@@ -14,7 +14,19 @@ SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from screener.config import MACD_FAST, MACD_SIGNAL, MACD_SLOW, RSI_PERIOD, TIMEFRAMES
+from screener.config import (
+    DEFAULT_ENABLED_DIVERGENCE_TYPES,
+    DEFAULT_ENABLED_INDICATORS,
+    MACD_FAST,
+    MA_REGIME_FILTER_MODE,
+    MACD_SIGNAL,
+    MACD_SLOW,
+    RSI_PERIOD,
+    TIMEFRAMES,
+    USE_ADJUSTED_PRICES,
+    USE_MA_REGIME_FILTER,
+    USE_STRICT_INDICATOR_PIVOTS,
+)
 from screener.data import fetch_candles, resample_ohlcv
 import screener.indicators as screener_indicators
 import screener.scanner as screener_scanner
@@ -37,10 +49,21 @@ def _load_price_cached(
     source_interval: str,
     period: str,
     resample_rule: str | None,
+    session_aware_resample: bool,
+    session_timezone: str | None,
+    session_start: str,
+    session_end: str,
 ) -> pd.DataFrame:
-    candles = fetch_candles(symbol, source_interval, period)
+    candles = fetch_candles(symbol, source_interval, period, auto_adjust=USE_ADJUSTED_PRICES)
     if resample_rule:
-        candles = resample_ohlcv(candles, resample_rule)
+        candles = resample_ohlcv(
+            candles,
+            resample_rule,
+            session_aware=session_aware_resample,
+            session_timezone=session_timezone,
+            session_start=session_start,
+            session_end=session_end,
+        )
     return candles
 
 
@@ -52,6 +75,10 @@ def load_price(symbol: str, timeframe: str) -> pd.DataFrame:
         source_interval=conf.source_interval,
         period=conf.period,
         resample_rule=conf.resample_rule,
+        session_aware_resample=conf.session_aware_resample,
+        session_timezone=conf.session_timezone,
+        session_start=conf.session_start,
+        session_end=conf.session_end,
     )
 
 
@@ -67,12 +94,16 @@ def _add_divergence_overlays(
     *,
     emphasize: bool = False,
 ) -> None:
+    def _is_bullish(div_type: str) -> bool:
+        return div_type in {"regular_bullish", "hidden_bullish"}
+
     a_time = _as_timestamp(signal_row["pivot_a_time"])
     b_time = _as_timestamp(signal_row["pivot_b_time"])
     a_price = float(signal_row["pivot_a_price"])
     b_price = float(signal_row["pivot_b_price"])
+    div_type = str(signal_row["divergence_type"])
 
-    price_color = "#2ca02c" if signal_row["divergence_type"] == "regular_bullish" else "#d62728"
+    price_color = "#2ca02c" if _is_bullish(div_type) else "#d62728"
     line_width = 4 if emphasize else 2
     marker_size = 10 if emphasize else 7
     marker_symbol = "diamond-open" if emphasize else "circle-open"
@@ -84,7 +115,7 @@ def _add_divergence_overlays(
             mode="lines+markers+text",
             text=["A", "B"],
             textposition="top center",
-            name=f"Divergence {legend_suffix}".strip(),
+            name=f"{div_type} {legend_suffix}".strip(),
             line={"color": price_color, "width": line_width},
             marker={"size": marker_size, "color": price_color, "symbol": marker_symbol},
         ),
@@ -101,10 +132,15 @@ def _add_divergence_overlays(
         indicator_series = macd["macd_hist"]
         indicator_row = 3
 
+    indicator_a_time = _as_timestamp(signal_row["indicator_a_time"]) if "indicator_a_time" in signal_row else a_time
+    indicator_b_time = _as_timestamp(signal_row["indicator_b_time"]) if "indicator_b_time" in signal_row else b_time
+    indicator_a = float(signal_row["indicator_a"]) if "indicator_a" in signal_row else float(indicator_series.loc[a_time])
+    indicator_b = float(signal_row["indicator_b"]) if "indicator_b" in signal_row else float(indicator_series.loc[b_time])
+
     fig.add_trace(
         go.Scatter(
-            x=[a_time, b_time],
-            y=[float(indicator_series.loc[a_time]), float(indicator_series.loc[b_time])],
+            x=[indicator_a_time, indicator_b_time],
+            y=[indicator_a, indicator_b],
             mode="lines+markers",
             name=f"{signal_row['indicator'].upper()} divergence {legend_suffix}".strip(),
             line={"color": price_color, "width": line_width, "dash": "dash"},
@@ -330,6 +366,8 @@ def _build_backtest_frame(history_results: pd.DataFrame, horizon_bars: int) -> p
         future_close = float(candles.iloc[end_idx]["close"])
         raw_return = (future_close / signal_close) - 1.0
         direction = 1.0 if row["divergence_type"] == "regular_bullish" else -1.0
+        if str(row["divergence_type"]).startswith("hidden_"):
+            direction = 1.0 if str(row["divergence_type"]).endswith("bullish") else -1.0
         strategy_return = raw_return * direction
 
         backtest_rows.append(
@@ -351,7 +389,7 @@ def _build_backtest_frame(history_results: pd.DataFrame, horizon_bars: int) -> p
 def main() -> None:
     st.set_page_config(page_title="MACD + RSI Divergence Screener", layout="wide")
     st.title("MACD + RSI Divergence Screener")
-    st.caption("MVP scanner for regular bullish/bearish divergence across 1h, 4h, 1d, and 1w")
+    st.caption("Scanner for regular + hidden divergence with causal scoring and MA regime filtering")
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -362,9 +400,34 @@ def main() -> None:
             options=list(TIMEFRAMES.keys()),
             default=["1h", "4h", "1d", "1w"],
         )
+    divergence_types = st.multiselect(
+        "Divergence types",
+        options=["regular_bullish", "regular_bearish", "hidden_bullish", "hidden_bearish"],
+        default=list(DEFAULT_ENABLED_DIVERGENCE_TYPES),
+    )
+    selected_indicators = st.multiselect(
+        "Indicators",
+        options=["rsi", "macd_hist"],
+        default=list(DEFAULT_ENABLED_INDICATORS),
+    )
+    use_ma_regime_filter = st.checkbox("Use MA regime filter (daily/weekly)", value=USE_MA_REGIME_FILTER)
+    ma_regime_filter_mode = st.selectbox(
+        "MA regime mode",
+        options=["soft", "hard"],
+        index=0 if MA_REGIME_FILTER_MODE == "soft" else 1,
+        help="Soft: reject only direct regime opposition. Hard: require exact regime alignment.",
+    )
+    strict_indicator_pivots = st.checkbox(
+        "Strict indicator pivots (require indicator swing pivots)",
+        value=USE_STRICT_INDICATOR_PIVOTS,
+    )
     if st.button("Clear price cache"):
         _load_price_cached.clear()
         st.success("Price cache cleared. Run Scan again to reload full history.")
+    if st.button("Clear scanner cache"):
+        if hasattr(screener_scanner, "clear_candle_cache"):
+            screener_scanner.clear_candle_cache()
+        st.success("Scanner candle cache cleared. Run Scan again to reload fresh candles.")
     backtest_enabled = st.checkbox("Show historical backtest", value=True)
     backtest_horizon = st.number_input(
         "Backtest horizon (bars)",
@@ -401,8 +464,28 @@ def main() -> None:
             return
 
         with st.spinner("Scanning symbols..."):
-            results = scan_universe(symbols, selected_tfs)
-            history_results = scan_universe_history(symbols, selected_tfs) if backtest_enabled else pd.DataFrame()
+            results = scan_universe(
+                symbols,
+                selected_tfs,
+                divergence_types=divergence_types,
+                indicators=selected_indicators,
+                use_ma_regime_filter=use_ma_regime_filter,
+                ma_regime_filter_mode=ma_regime_filter_mode,
+                strict_indicator_pivots=strict_indicator_pivots,
+            )
+            history_results = (
+                scan_universe_history(
+                    symbols,
+                    selected_tfs,
+                    divergence_types=divergence_types,
+                    indicators=selected_indicators,
+                    use_ma_regime_filter=use_ma_regime_filter,
+                    ma_regime_filter_mode=ma_regime_filter_mode,
+                    strict_indicator_pivots=strict_indicator_pivots,
+                )
+                if backtest_enabled
+                else pd.DataFrame()
+            )
 
         coverage = pd.DataFrame({"symbol": symbols})
         coverage["signal_count"] = coverage["symbol"].map(results["symbol"].value_counts()).fillna(0).astype(int)
@@ -452,6 +535,27 @@ def main() -> None:
             )
 
             row = results.iloc[int(selected_idx)]
+            st.subheader("Signal Diagnostics")
+            diagnostics = pd.DataFrame(
+                [
+                    {
+                        "symbol": row.get("symbol"),
+                        "timeframe": row.get("timeframe"),
+                        "divergence_type": row.get("divergence_type"),
+                        "indicator": row.get("indicator"),
+                        "price_move_pct": row.get("price_move_pct"),
+                        "indicator_move": row.get("indicator_move"),
+                        "pivot_gap_bars": row.get("pivot_gap_bars"),
+                        "ma_regime": row.get("ma_regime"),
+                        "ma_regime_timeframe": row.get("ma_regime_timeframe"),
+                        "score": row.get("score"),
+                    }
+                ]
+            )
+            st.dataframe(diagnostics, width="stretch")
+            st.caption("Score component breakdown")
+            st.json(row.get("score_components", {}), expanded=False)
+
             same_asset_tf = results[
                 (results["symbol"] == row["symbol"]) & (results["timeframe"] == row["timeframe"])
             ].reset_index(drop=True)

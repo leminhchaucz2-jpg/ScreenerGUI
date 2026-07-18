@@ -1,0 +1,28 @@
+{
+  "symbols": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN"
+  ],
+  "timeframes": [
+    "1h",
+    "4h",
+    "1d",
+    "1w"
+  ],
+  "runs": 3,
+  "cache_on_seconds": [
+    114.48465399999986,
+    93.66319299998577,
+    97.71840490002069
+  ],
+  "cache_off_seconds": [
+    97.38473169997451,
+    97.26580449999892,
+    100.88410889997613
+  ],
+  "cache_on_mean_seconds": 101.9554,
+  "cache_off_mean_seconds": 98.5115,
+  "cache_improvement_pct": -3.5
+}

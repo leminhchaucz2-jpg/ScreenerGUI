@@ -1,0 +1,10 @@
+{
+  "fixture": "aapl_like_snapshot",
+  "symbol": "AAPL",
+  "timeframe": "1d",
+  "divergence_type": "regular_bullish",
+  "indicator": "rsi",
+  "loose_count": 1,
+  "strict_count": 0,
+  "reduction_pct": 100.0
+}

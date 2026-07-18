@@ -1,0 +1,28 @@
+{
+  "symbols": [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN"
+  ],
+  "timeframes": [
+    "1h",
+    "4h",
+    "1d",
+    "1w"
+  ],
+  "runs": 2,
+  "fetch_delay_ms": 150,
+  "benchmark_type": "same_session_synthetic_repeat",
+  "cache_on_seconds": [
+    8.02724809999927,
+    9.224450300011085
+  ],
+  "cache_off_seconds": [
+    11.306349999998929,
+    10.585858299979009
+  ],
+  "cache_on_mean_seconds": 8.6258,
+  "cache_off_mean_seconds": 10.9461,
+  "cache_improvement_pct": 21.2
+}

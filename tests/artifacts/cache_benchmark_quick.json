@@ -1,0 +1,20 @@
+{
+  "symbols": [
+    "AAPL",
+    "MSFT"
+  ],
+  "timeframes": [
+    "1d",
+    "1w"
+  ],
+  "runs": 1,
+  "cache_on_seconds": [
+    44.457064700021874
+  ],
+  "cache_off_seconds": [
+    51.60614400001941
+  ],
+  "cache_on_mean_seconds": 44.4571,
+  "cache_off_mean_seconds": 51.6061,
+  "cache_improvement_pct": 13.85
+}

@@ -16,10 +16,18 @@ class DivergenceSignal:
     pivot_b_price: float
     indicator_a: float
     indicator_b: float
+    indicator_a_time: datetime
+    indicator_b_time: datetime
+    price_move_pct: float
+    indicator_move: float
+    pivot_gap_bars: int
     sma_50: float | None
     sma_200: float | None
     sma_cross: str
     sma_cross_time: datetime | None
+    ma_regime: str
+    ma_regime_timeframe: str | None
+    score_components: dict[str, int]
     score: int
     note: str
 

@@ -18,7 +18,17 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
 
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.bfill()
+
+    # Wilder edge cases:
+    # - no losses -> RSI = 100
+    # - no gains -> RSI = 0
+    # - no gains and no losses (flat price) -> RSI = 50
+    no_loss = avg_loss == 0
+    no_gain = avg_gain == 0
+    rsi = rsi.where(~(no_loss & ~no_gain), 100.0)
+    rsi = rsi.where(~(no_gain & ~no_loss), 0.0)
+    rsi = rsi.where(~(no_gain & no_loss), 50.0)
+    return rsi
 
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
