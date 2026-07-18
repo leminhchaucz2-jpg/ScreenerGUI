@@ -40,6 +40,16 @@ pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
+4. Stop the app:
+
+In the same terminal where Streamlit is running, press `Ctrl+C`.
+
+If needed on Windows, you can also stop all Streamlit processes with:
+
+```powershell
+taskkill /IM streamlit.exe /F
+```
+
 Alternative command (if `streamlit` is directly available on PATH):
 
 ```powershell
