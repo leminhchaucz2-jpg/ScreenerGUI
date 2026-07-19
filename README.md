@@ -2,7 +2,9 @@
 
 A Streamlit stock screener for regular and hidden divergence between price and two indicators: RSI and MACD histogram.
 
-It scans multiple symbols and timeframes, ranks the strongest setups, and visualizes each signal with chart overlays and diagnostics.
+It scans one symbol at a time across selected timeframes, ranks the strongest setups, and visualizes each signal with chart overlays and diagnostics.
+
+You can type either a ticker or a company name in the symbol field. The app shows matching suggestions (ticker + company name), and scans the selected ticker.
 
 ## What It Does
 
@@ -79,6 +81,8 @@ streamlit run app.py
 - Price download uses adjusted OHLC by default for cleaner long-history indicator behavior.
 - `4h` candles are resampled from `1h` data and aligned to regular US market hours (`09:30-16:00` ET).
 - In the UI, you can choose divergence types, indicators, MA regime filtering, strict indicator pivots, and whether to keep opposite-direction conflicts.
+- The symbol input supports search-style suggestions (for example: "Apple" -> `AAPL`, "Micro" -> `MSFT`, `MU`, etc.).
+- The UI uses a single-symbol workflow for faster interactive scans.
 - MA regime mode:
   - `soft`: reject only signals directly opposing regime
   - `hard`: require exact regime alignment

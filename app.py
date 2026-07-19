@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 from plotly.subplots import make_subplots
 
 SRC_DIR = Path(__file__).resolve().parent / "src"
@@ -82,8 +83,139 @@ def load_price(symbol: str, timeframe: str) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=3600)
+def search_symbol_suggestions(query: str, max_results: int = 8) -> list[dict[str, str]]:
+    query = query.strip()
+    if len(query) < 2:
+        return []
+
+    try:
+        search = yf.Search(query, max_results=max_results)
+    except Exception:
+        return []
+
+    suggestions: list[dict[str, str]] = []
+    for item in (search.quotes or []):
+        if item.get("quoteType") != "EQUITY":
+            continue
+        symbol = str(item.get("symbol", "")).strip().upper()
+        if not symbol:
+            continue
+        name = str(item.get("longname") or item.get("shortname") or "Unknown")
+        exch = str(item.get("exchDisp") or item.get("exchange") or "")
+        label = f"{symbol} - {name}" if not exch else f"{symbol} - {name} ({exch})"
+        suggestions.append({"symbol": symbol, "label": label})
+
+    # Deduplicate by symbol while preserving rank.
+    deduped: dict[str, dict[str, str]] = {}
+    for suggestion in suggestions:
+        deduped.setdefault(suggestion["symbol"], suggestion)
+    return list(deduped.values())
+
+
 def _as_timestamp(value: object) -> pd.Timestamp:
     return pd.Timestamp(value)
+
+
+def _humanize_text(value: object) -> str:
+    text = str(value)
+    text = text.replace("_", " ")
+    text = text.replace(" pct", " %")
+    text = text.replace("Pct", "%")
+    return text
+
+
+DISPLAY_COLUMN_ALIASES: dict[str, str] = {
+    "pivot_a_time": "start pivot time",
+    "pivot_b_time": "end pivot time",
+    "pivot_a_price": "start pivot price",
+    "pivot_b_price": "end pivot price",
+    "indicator_a_time": "indicator start time",
+    "indicator_b_time": "indicator end time",
+    "indicator_a": "indicator value at start pivot",
+    "indicator_b": "indicator value at end pivot",
+    "price_move_pct": "price move between pivots pct",
+    "indicator_move": "indicator move between pivots",
+    "pivot_gap_bars": "bars between pivots",
+    "ma_regime": "MA regime",
+    "ma_regime_timeframe": "MA regime timeframe",
+    "signal_count": "signals found",
+    "trade_side": "trade side",
+    "forward_return_pct": "forward return pct",
+    "strategy_return_pct": "strategy return pct",
+}
+
+
+def _pretty_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    pretty = frame.copy()
+    pretty = pretty.rename(
+        columns={
+            col: DISPLAY_COLUMN_ALIASES.get(str(col), _humanize_text(col))
+            for col in pretty.columns
+        }
+    )
+
+    for col in ["divergence type", "indicator", "ma regime", "ma regime timeframe", "sma cross"]:
+        if col in pretty.columns:
+            pretty[col] = pretty[col].astype(str).map(_humanize_text)
+    return pretty
+
+
+def _format_pct_values(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    formatted = frame.copy()
+    for col in formatted.columns:
+        col_name = str(col).lower()
+        if "pct" not in col_name and "%" not in col_name:
+            continue
+        formatted[col] = formatted[col].apply(
+            lambda v: f"{float(v):.2f}%" if pd.notna(v) else v
+        )
+    return formatted
+
+
+def _format_currency_values(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    formatted = frame.copy()
+
+    def _to_currency(value: object) -> object:
+        if pd.isna(value):
+            return value
+        try:
+            return f"${float(value):,.2f}"
+        except (TypeError, ValueError):
+            return value
+
+    for col in formatted.columns:
+        col_name = str(col).lower()
+        is_price_value_col = "price" in col_name and "pct" not in col_name and "%" not in col_name
+        if is_price_value_col:
+            formatted[col] = formatted[col].apply(_to_currency)
+    return formatted
+
+
+def _build_market_rangebreaks(candles: pd.DataFrame, timeframe: str, *, hide_non_trading_gaps: bool) -> list[dict[str, object]]:
+    if not hide_non_trading_gaps:
+        return []
+
+    if candles.empty or len(candles.index) < 3:
+        return []
+
+    # Intraday compression is handled with a category x-axis in render_technical_chart.
+    if timeframe in {"1h", "4h"}:
+        return []
+
+    if timeframe in {"1d", "1w"}:
+        return [{"bounds": ["sat", "mon"]}]
+
+    return []
 
 
 def _add_divergence_overlays(
@@ -102,6 +234,7 @@ def _add_divergence_overlays(
     a_price = float(signal_row["pivot_a_price"])
     b_price = float(signal_row["pivot_b_price"])
     div_type = str(signal_row["divergence_type"])
+    display_div_type = _humanize_text(div_type)
 
     price_color = "#2ca02c" if _is_bullish(div_type) else "#d62728"
     line_width = 4 if emphasize else 2
@@ -115,7 +248,7 @@ def _add_divergence_overlays(
             mode="lines+markers+text",
             text=["A", "B"],
             textposition="top center",
-            name=f"{div_type} {legend_suffix}".strip(),
+            name=f"{display_div_type} {legend_suffix}".strip(),
             line={"color": price_color, "width": line_width},
             marker={"size": marker_size, "color": price_color, "symbol": marker_symbol},
         ),
@@ -142,7 +275,7 @@ def _add_divergence_overlays(
             x=[indicator_a_time, indicator_b_time],
             y=[indicator_a, indicator_b],
             mode="lines+markers",
-            name=f"{signal_row['indicator'].upper()} divergence {legend_suffix}".strip(),
+            name=f"{_humanize_text(str(signal_row['indicator']).upper())} divergence {legend_suffix}".strip(),
             line={"color": price_color, "width": line_width, "dash": "dash"},
             marker={"size": max(marker_size - 1, 5), "color": price_color},
         ),
@@ -210,6 +343,7 @@ def render_technical_chart(
     signal_row: pd.Series | None = None,
     all_signal_rows: pd.DataFrame | None = None,
     max_chart_bars: int = 800,
+    hide_non_trading_gaps: bool = True,
 ) -> None:
     full_candles = load_price(symbol, timeframe)
     if full_candles.empty:
@@ -260,7 +394,13 @@ def render_technical_chart(
         col=1,
     )
     fig.add_trace(
-        go.Scatter(x=candles.index, y=sma_200, mode="lines", name="SMA 200", line={"color": "#111111", "width": 1.8}),
+        go.Scatter(
+            x=candles.index,
+            y=sma_200,
+            mode="lines",
+            name="SMA 200",
+            line={"color": "#6d28d9", "width": 2.3},
+        ),
         row=1,
         col=1,
     )
@@ -314,12 +454,26 @@ def render_technical_chart(
     fig.update_layout(
         title=f"{symbol} - {timeframe} Technical View",
         xaxis_rangeslider_visible=False,
-        margin={"l": 10, "r": 10, "t": 40, "b": 10},
+        margin={"l": 10, "r": 10, "t": 50, "b": 130},
         height=780,
         dragmode="pan",
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.01, "xanchor": "right", "x": 1.0},
+        legend={
+            "orientation": "h",
+            "yanchor": "top",
+            "y": -0.18,
+            "xanchor": "left",
+            "x": 0.0,
+        },
     )
-    fig.update_xaxes(range=[candles.index.min(), candles.index.max()])
+    if hide_non_trading_gaps and timeframe in {"1h", "4h"}:
+        # Category axis removes timeline gaps without relying on timezone-sensitive
+        # datetime rangebreak filtering.
+        fig.update_xaxes(type="category")
+    else:
+        fig.update_xaxes(
+            range=[candles.index.min(), candles.index.max()],
+            rangebreaks=_build_market_rangebreaks(candles, timeframe, hide_non_trading_gaps=hide_non_trading_gaps),
+        )
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
     fig.update_yaxes(title_text="MACD", row=3, col=1)
@@ -369,6 +523,7 @@ def _build_backtest_frame(history_results: pd.DataFrame, horizon_bars: int) -> p
         if str(row["divergence_type"]).startswith("hidden_"):
             direction = 1.0 if str(row["divergence_type"]).endswith("bullish") else -1.0
         strategy_return = raw_return * direction
+        trade_side = "long" if direction > 0 else "short"
 
         backtest_rows.append(
             {
@@ -376,6 +531,7 @@ def _build_backtest_frame(history_results: pd.DataFrame, horizon_bars: int) -> p
                 "timeframe": row["timeframe"],
                 "divergence_type": row["divergence_type"],
                 "indicator": row["indicator"],
+                "trade_side": trade_side,
                 "signal_time": signal_time,
                 "forward_return_pct": raw_return * 100.0,
                 "strategy_return_pct": strategy_return * 100.0,
@@ -391,9 +547,36 @@ def main() -> None:
     st.title("MACD + RSI Divergence Screener")
     st.caption("Scanner for regular + hidden divergence with causal scoring and MA regime filtering")
 
+    if "symbol_input" not in st.session_state:
+        st.session_state.symbol_input = "AAPL"
+
     col1, col2 = st.columns([2, 1])
     with col1:
-        raw_symbols = st.text_input("Symbols (comma separated)", value="AAPL,MSFT,TSLA,NVDA")
+        symbol_query = st.text_input(
+            "Symbol or company",
+            value=st.session_state.symbol_input,
+            help="Type a ticker or company name (for example: AAPL, Apple, Microsoft).",
+            key="symbol_query",
+        )
+
+        suggestions = search_symbol_suggestions(symbol_query)
+        selected_symbol = symbol_query.strip().upper()
+        if suggestions:
+            options = [s["label"] for s in suggestions]
+            label_to_symbol = {s["label"]: s["symbol"] for s in suggestions}
+            default_label = next(
+                (s["label"] for s in suggestions if s["symbol"] == selected_symbol),
+                options[0],
+            )
+            picked_label = st.selectbox(
+                "Suggestions",
+                options=options,
+                index=options.index(default_label),
+                help="Pick the symbol to scan.",
+            )
+            selected_symbol = label_to_symbol[picked_label]
+
+        st.session_state.symbol_input = selected_symbol
     with col2:
         selected_tfs = st.multiselect(
             "Timeframes",
@@ -404,11 +587,13 @@ def main() -> None:
         "Divergence types",
         options=["regular_bullish", "regular_bearish", "hidden_bullish", "hidden_bearish"],
         default=list(DEFAULT_ENABLED_DIVERGENCE_TYPES),
+        format_func=_humanize_text,
     )
     selected_indicators = st.multiselect(
         "Indicators",
         options=["rsi", "macd_hist"],
         default=list(DEFAULT_ENABLED_INDICATORS),
+        format_func=_humanize_text,
     )
     use_ma_regime_filter = st.checkbox("Use MA regime filter (daily/weekly)", value=USE_MA_REGIME_FILTER)
     ma_regime_filter_mode = st.selectbox(
@@ -455,10 +640,11 @@ def main() -> None:
     run_scan = st.button("Run Scan", type="primary")
 
     if run_scan:
-        symbols = [s.strip().upper() for s in raw_symbols.split(",") if s.strip()]
-        if not symbols:
-            st.warning("Please provide at least one symbol.")
+        symbol = st.session_state.symbol_input.strip().upper()
+        if not symbol:
+            st.warning("Please provide a symbol.")
             return
+        symbols = [symbol]
         if not selected_tfs:
             st.warning("Please select at least one timeframe.")
             return
@@ -508,15 +694,21 @@ def main() -> None:
         chart_max_bars = st.session_state.get("scan_chart_max_bars", int(chart_max_bars))
 
         st.subheader("Scan Coverage")
-        st.dataframe(coverage, width="stretch")
+        st.dataframe(_pretty_dataframe(_format_currency_values(coverage)), width="stretch")
 
         st.subheader("Signals")
         if results.empty:
             st.info("No divergences found with current settings.")
         else:
-            st.dataframe(results, width="stretch")
+            st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(results))), width="stretch")
 
             st.subheader("Chart Preview")
+            hide_non_trading_gaps = st.checkbox(
+                "Hide non-trading gaps",
+                value=st.session_state.get("chart_hide_non_trading_gaps", True),
+                key="chart_hide_non_trading_gaps",
+                help="Toggle to compare compressed market-time view vs continuous timeline.",
+            )
             options = list(range(len(results)))
             if not options:
                 return
@@ -530,7 +722,8 @@ def main() -> None:
                 key="selected_signal_row",
                 format_func=lambda i: (
                     f"{i} | {results.iloc[i]['symbol']} | {results.iloc[i]['timeframe']} | "
-                    f"{results.iloc[i]['divergence_type']} | {results.iloc[i]['indicator']}"
+                    f"{_humanize_text(results.iloc[i]['divergence_type'])} | "
+                    f"{_humanize_text(results.iloc[i]['indicator'])}"
                 ),
             )
 
@@ -541,20 +734,31 @@ def main() -> None:
                     {
                         "symbol": row.get("symbol"),
                         "timeframe": row.get("timeframe"),
-                        "divergence_type": row.get("divergence_type"),
-                        "indicator": row.get("indicator"),
-                        "price_move_pct": row.get("price_move_pct"),
-                        "indicator_move": row.get("indicator_move"),
-                        "pivot_gap_bars": row.get("pivot_gap_bars"),
-                        "ma_regime": row.get("ma_regime"),
-                        "ma_regime_timeframe": row.get("ma_regime_timeframe"),
+                        "divergence type": _humanize_text(row.get("divergence_type")),
+                        "indicator": _humanize_text(row.get("indicator")),
+                        "start pivot price": row.get("pivot_a_price"),
+                        "end pivot price": row.get("pivot_b_price"),
+                        "price move %": row.get("price_move_pct"),
+                        "indicator move": row.get("indicator_move"),
+                        "pivot gap bars": row.get("pivot_gap_bars"),
+                        "ma regime": _humanize_text(row.get("ma_regime")),
+                        "ma regime timeframe": _humanize_text(row.get("ma_regime_timeframe")),
                         "score": row.get("score"),
                     }
                 ]
             )
-            st.dataframe(diagnostics, width="stretch")
+            st.dataframe(_format_pct_values(_format_currency_values(diagnostics)), width="stretch")
             st.caption("Score component breakdown")
-            st.json(row.get("score_components", {}), expanded=False)
+            score_components = row.get("score_components", {})
+            pretty_components = {
+                _humanize_text(k): v for k, v in (score_components.items() if isinstance(score_components, dict) else [])
+            }
+            st.json(pretty_components, expanded=False)
+            st.caption(
+                "Score is a ranking strength metric. Higher score means stronger multi-factor confirmation, "
+                "not guaranteed profit. It combines timeframe weight, indicator confirmation, recent price impulse, "
+                "price/indicator strength, swing compactness, and MA regime alignment."
+            )
 
             same_asset_tf = results[
                 (results["symbol"] == row["symbol"]) & (results["timeframe"] == row["timeframe"])
@@ -568,6 +772,7 @@ def main() -> None:
                 signal_row=row,
                 all_signal_rows=same_asset_tf,
                 max_chart_bars=int(chart_max_bars),
+                hide_non_trading_gaps=hide_non_trading_gaps,
             )
 
         if backtest_enabled:
@@ -583,14 +788,25 @@ def main() -> None:
                         [
                             {
                                 "signals": len(backtest_df),
-                                "win_rate_pct": round(backtest_df["win"].mean() * 100.0, 2),
-                                "avg_strategy_return_pct": round(backtest_df["strategy_return_pct"].mean(), 2),
-                                "median_strategy_return_pct": round(backtest_df["strategy_return_pct"].median(), 2),
+                                "win rate pct": round(backtest_df["win"].mean() * 100.0, 2),
+                                "avg strategy return pct": round(backtest_df["strategy_return_pct"].mean(), 2),
+                                "median strategy return pct": round(backtest_df["strategy_return_pct"].median(), 2),
                             }
                         ]
                     )
-                    st.dataframe(summary, width="stretch")
-                    st.dataframe(backtest_df, width="stretch")
+                    st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(summary))), width="stretch")
+                    st.caption(
+                        "Forward return is raw price change after the signal. "
+                        "Strategy return applies signal direction: long keeps sign, short flips sign."
+                    )
+                    st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(backtest_df))), width="stretch")
+                    st.caption("Divergence type guide")
+                    st.markdown(
+                        "- regular bullish: price makes a lower low while the indicator makes a higher low (possible upside reversal).\n"
+                        "- regular bearish: price makes a higher high while the indicator makes a lower high (possible downside reversal).\n"
+                        "- hidden bullish: price makes a higher low while the indicator makes a lower low (bullish continuation bias).\n"
+                        "- hidden bearish: price makes a lower high while the indicator makes a higher high (bearish continuation bias)."
+                    )
 
 
 if __name__ == "__main__":
