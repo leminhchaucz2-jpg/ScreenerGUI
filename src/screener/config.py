@@ -137,7 +137,23 @@ MIN_PRICE_MOVE_PCT = 0.005
 MIN_INDICATOR_MOVE = 0.5
 MACD_HIST_MIN_MOVE_PCT = 0.0015
 RSI_PERIOD = 14
+ATR_PERIOD = 14
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+STOCH_RSI_PERIOD = 14
+STOCH_RSI_SMOOTH_K = 3
+STOCH_RSI_SMOOTH_D = 3
+CCI_PERIOD = 20
+# CCI typically swings +-100 to +-300, an order of magnitude larger than RSI's
+# 0-100 scale, so it needs its own absolute move threshold rather than reusing
+# MIN_INDICATOR_MOVE.
+CCI_MIN_INDICATOR_MOVE = 40.0
+BOLLINGER_PERIOD = 20
+BOLLINGER_NUM_STD = 2.0
+ADX_PERIOD = 14
+# OBV is a cumulative volume count with no natural bound, unlike RSI's 0-100
+# scale, so its divergence threshold is expressed as a fraction of the
+# symbol's own recent average bar volume instead of an absolute value.
+OBV_MIN_MOVE_PCT_OF_AVG_VOLUME = 5.0
 BACKTEST_FORWARD_BARS = 10
