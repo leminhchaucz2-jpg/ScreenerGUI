@@ -22,9 +22,11 @@ You can type either a ticker or a company name in the symbol field. The app show
 - MA regime filter supports `soft` and `hard` modes
 - Optional strict indicator-pivot mode (indicator pivots must be independently detected)
 - Timeframe-specific scan thresholds and pivot prominence filter
+- MACD histogram move threshold scales with the symbol's price (percentage-of-price), so filtering stays consistent across a $5 stock and a $2,000 stock instead of using one fixed absolute number
 - Optional non-consecutive pivot pairing via per-timeframe pivot lookback
 - Session-aware `4h` resampling aligned to US market hours
 - Signal deduplication and directional conflict resolution
+- Historical backtest entries are priced at the pivot's confirmation bar (pivot time + the timeframe's right-side pivot bars), not the pivot bar itself, to avoid look-ahead bias
 - Streamlit UI with signal table and chart preview
 
 ## Why These Settings
@@ -33,6 +35,8 @@ You can type either a ticker or a company name in the symbol field. The app show
 - Strict indicator pivots are optional because they reduce false positives, but they also filter more aggressively.
 - Non-consecutive pivot pairing is enabled because it can recover valid setups that consecutive-only pairing misses.
 - Session-aware `4h` resampling keeps intraday bars aligned to regular US market hours.
+- MACD histogram is priced in raw dollars (unlike RSI's bounded 0-100 scale), so its minimum-move filter (`macd_hist_min_move_pct` in `ScanRule`) is expressed as a fraction of price and scaled per symbol at scan time, instead of reusing RSI's fixed absolute threshold.
+- Backtest entries use the pivot's confirmation bar rather than the pivot bar itself, because a pivot can't be identified as a local extreme until the timeframe's right-side confirmation bars have printed; pricing the entry any earlier would silently look ahead.
 
 ## Project Structure
 
@@ -51,6 +55,14 @@ You can type either a ticker or a company name in the symbol field. The app show
 
 ```powershell
 pip install -r requirements.txt
+```
+
+If your Windows Python install is broken (e.g. `python` resolves to the Microsoft Store stub instead of a real interpreter), [uv](https://github.com/astral-sh/uv) is a reliable alternative that manages both Python and the virtual environment:
+
+```powershell
+uv venv .venv --python 3.12
+uv pip install -r requirements.txt --python .venv
+.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
 3. Run the app:
@@ -88,7 +100,28 @@ streamlit run app.py
   - `hard`: require exact regime alignment
 - The persistent scanner candle cache is session-scoped; use the UI button to clear it when you want a fresh scan session.
 - The benchmark script uses synthetic same-session repeats, so it measures scanner cache behavior without network noise.
+- The historical backtest table includes `entry_time` (the confirmation bar the trade is priced at) and `confirmation_lag_bars` (how many bars after the pivot that confirmation took), alongside the original `signal_time` (the pivot bar itself).
 - This is not trading advice and should be validated with out-of-sample testing before live use.
+
+## Development And Testing
+
+Install dev/test dependencies (adds `pytest` and `playwright` on top of the runtime requirements):
+
+```powershell
+pip install -r requirements-dev.txt
+```
+
+Run the test suite:
+
+```powershell
+pytest
+```
+
+Playwright is only needed for manual browser-driven QA (screenshotting the running app), not for `pytest`. One-time browser download after installing the `requirements-dev.txt` deps:
+
+```powershell
+python -m playwright install chromium
+```
 
 ## Benchmarking And Tracking
 

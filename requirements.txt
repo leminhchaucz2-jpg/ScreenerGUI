@@ -3,4 +3,3 @@ pandas>=2.2.2
 numpy>=1.26.4
 yfinance>=0.2.54
 plotly>=5.23.0
-pytest>=8.2.0

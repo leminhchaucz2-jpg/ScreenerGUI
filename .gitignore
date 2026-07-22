@@ -28,6 +28,9 @@ htmlcov/
 # Streamlit local settings and secrets
 .streamlit/secrets.toml
 
+# Local run logs
+*.log
+
 # Local env files
 .env
 .env.*

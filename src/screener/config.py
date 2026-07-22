@@ -26,6 +26,11 @@ class ScanRule:
     pivot_lookaround_bars: int = 2
     min_pivot_prominence_atr: float = 0.35
     pivot_pair_lookback: int = 1
+    # MACD histogram is priced in raw dollars (EMA-fast - EMA-slow), unlike RSI's
+    # bounded 0-100 scale, so a fixed absolute min_indicator_move is meaningless
+    # across symbols at different price levels. This threshold is expressed as a
+    # fraction of the symbol's current price instead.
+    macd_hist_min_move_pct: float = 0.0015
 
 
 TIMEFRAMES: dict[str, TimeframeConfig] = {
@@ -62,6 +67,7 @@ TIMEFRAME_SCAN_RULES: dict[str, ScanRule] = {
         pivot_lookaround_bars=2,
         min_pivot_prominence_atr=0.45,
         pivot_pair_lookback=2,
+        macd_hist_min_move_pct=0.0020,
     ),
     "4h": ScanRule(
         min_bars_required=240,
@@ -73,6 +79,7 @@ TIMEFRAME_SCAN_RULES: dict[str, ScanRule] = {
         pivot_lookaround_bars=2,
         min_pivot_prominence_atr=0.4,
         pivot_pair_lookback=2,
+        macd_hist_min_move_pct=0.0018,
     ),
     "1d": ScanRule(
         min_bars_required=260,
@@ -84,6 +91,7 @@ TIMEFRAME_SCAN_RULES: dict[str, ScanRule] = {
         pivot_lookaround_bars=2,
         min_pivot_prominence_atr=0.35,
         pivot_pair_lookback=3,
+        macd_hist_min_move_pct=0.0015,
     ),
     "1w": ScanRule(
         min_bars_required=220,
@@ -95,6 +103,7 @@ TIMEFRAME_SCAN_RULES: dict[str, ScanRule] = {
         pivot_lookaround_bars=1,
         min_pivot_prominence_atr=0.3,
         pivot_pair_lookback=3,
+        macd_hist_min_move_pct=0.0012,
     ),
 }
 
@@ -126,6 +135,7 @@ PIVOT_RIGHT_BARS = 3
 PIVOT_MAX_GAP_BARS = 60
 MIN_PRICE_MOVE_PCT = 0.005
 MIN_INDICATOR_MOVE = 0.5
+MACD_HIST_MIN_MOVE_PCT = 0.0015
 RSI_PERIOD = 14
 MACD_FAST = 12
 MACD_SLOW = 26

@@ -285,3 +285,87 @@ def test_strict_mode_reduces_signal_count_on_same_snapshot(monkeypatch, aapl_lik
     assert loose_count > 0
     assert strict_count <= loose_count
     assert reduction_pct > 0.0
+
+
+def test_macd_hist_effective_min_move_scales_with_price() -> None:
+    cheap_threshold = scanner._macd_hist_effective_min_move(10.0, 0.0015, fallback_min_indicator_move=0.5)
+    expensive_threshold = scanner._macd_hist_effective_min_move(1000.0, 0.0015, fallback_min_indicator_move=0.5)
+
+    assert cheap_threshold == pytest.approx(0.015)
+    assert expensive_threshold == pytest.approx(1.5)
+    # Same relative move percentage should require a proportionally larger absolute
+    # histogram swing for the higher-priced symbol, not the same fixed number.
+    assert expensive_threshold > cheap_threshold
+
+    # Falls back to the absolute RSI-style threshold when price is unusable.
+    assert scanner._macd_hist_effective_min_move(0.0, 0.0015, fallback_min_indicator_move=0.5) == 0.5
+
+
+def test_scan_universe_scales_macd_threshold_by_symbol_price(monkeypatch) -> None:
+    index = pd.date_range("2020-01-01", periods=320, freq="D", tz="UTC")
+    cheap_close = pd.Series(10.0 + (pd.Series(range(320), index=index) * 0.01), index=index)
+    expensive_close = pd.Series(1000.0 + (pd.Series(range(320), index=index) * 1.0), index=index)
+
+    candles_by_symbol = {
+        "CHEAP": _make_candles(index, cheap_close),
+        "PRICEY": _make_candles(index, expensive_close),
+    }
+
+    def fake_fetch_candles(symbol: str, interval: str, period: str, auto_adjust: bool = True) -> pd.DataFrame:
+        return candles_by_symbol[symbol]
+
+    def fake_compute_rsi(close_series: pd.Series, period: int = 14) -> pd.Series:
+        return pd.Series(50.0, index=close_series.index)
+
+    def fake_compute_macd(close_series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+        # Scale histogram with price so it plausibly looks like a real MACD histogram.
+        hist = close_series * 0.002
+        return pd.DataFrame({"macd": hist, "macd_signal": hist, "macd_hist": hist}, index=close_series.index)
+
+    def make_capturing_find_divergences(calls: list[float]):
+        def fake_find_divergences(price_close, indicator_series, *, min_indicator_move, **kwargs):
+            # _scan_symbol iterates `selected_indicators` in the order passed in
+            # (["rsi", "macd_hist"]), for a single timeframe/divergence_type here,
+            # so call order deterministically identifies which indicator this is -
+            # more robust than guessing from series values or object identity
+            # (DataFrame column extraction doesn't preserve `is` identity).
+            calls.append(min_indicator_move)
+            return []
+
+        return fake_find_divergences
+
+    monkeypatch.setattr(scanner, "fetch_candles", fake_fetch_candles)
+    monkeypatch.setattr(scanner, "compute_rsi", fake_compute_rsi)
+    monkeypatch.setattr(scanner, "compute_macd", fake_compute_macd)
+
+    cheap_calls: list[float] = []
+    monkeypatch.setattr(scanner, "find_divergences", make_capturing_find_divergences(cheap_calls))
+    scanner.scan_universe(
+        symbols=["CHEAP"],
+        timeframes=["1d"],
+        divergence_types=["regular_bullish"],
+        indicators=["rsi", "macd_hist"],
+        use_ma_regime_filter=False,
+    )
+
+    expensive_calls: list[float] = []
+    monkeypatch.setattr(scanner, "find_divergences", make_capturing_find_divergences(expensive_calls))
+    scanner.scan_universe(
+        symbols=["PRICEY"],
+        timeframes=["1d"],
+        divergence_types=["regular_bullish"],
+        indicators=["rsi", "macd_hist"],
+        use_ma_regime_filter=False,
+    )
+
+    assert len(cheap_calls) == 2
+    assert len(expensive_calls) == 2
+    cheap_rsi_move, cheap_macd_move = cheap_calls
+    expensive_rsi_move, expensive_macd_move = expensive_calls
+
+    # RSI threshold is absolute and must not change with price level.
+    assert cheap_rsi_move == expensive_rsi_move
+
+    # MACD threshold must scale with price level (roughly the ~100x price ratio
+    # between the two fixtures), unlike the old fixed absolute threshold.
+    assert expensive_macd_move > cheap_macd_move * 10

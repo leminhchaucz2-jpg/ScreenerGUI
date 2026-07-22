@@ -16,6 +16,7 @@ from .config import (
     ENABLE_REGULAR_DIVERGENCE,
     KEEP_STRONGEST_CONFLICT_ONLY,
     MACD_FAST,
+    MACD_HIST_MIN_MOVE_PCT,
     MA_REGIME_FILTER_MODE,
     MA_REGIME_TIMEFRAMES,
     MACD_SIGNAL,
@@ -182,6 +183,24 @@ def _score_signal(
     if score < 0:
         score = 0
     return score, components
+
+
+def _macd_hist_effective_min_move(
+    last_price: float,
+    macd_hist_min_move_pct: float,
+    fallback_min_indicator_move: float,
+) -> float:
+    """Scale the MACD histogram move threshold by price.
+
+    MACD histogram is priced in raw dollars (EMA-fast - EMA-slow), unlike RSI's
+    bounded 0-100 scale, so a fixed absolute min_indicator_move is not comparable
+    across symbols at different price levels: it under-filters expensive names and
+    over-filters cheap ones. Falls back to the absolute threshold if price is
+    unusable (e.g. no candles yet).
+    """
+    if last_price > 0:
+        return macd_hist_min_move_pct * last_price
+    return fallback_min_indicator_move
 
 
 def _filter_divergence_types(divergence_types: list[str] | None) -> list[DivergenceType]:
@@ -385,6 +404,7 @@ def _scan_symbol(
         pivot_gap = PIVOT_MAX_GAP_BARS if rule is None else rule.pivot_max_gap_bars
         min_price_move = MIN_PRICE_MOVE_PCT if rule is None else rule.min_price_move_pct
         min_indicator_move = MIN_INDICATOR_MOVE if rule is None else rule.min_indicator_move
+        macd_hist_min_move_pct = MACD_HIST_MIN_MOVE_PCT if rule is None else rule.macd_hist_min_move_pct
         lookaround = 2 if rule is None else rule.pivot_lookaround_bars
         min_prominence = 0.35 if rule is None else rule.min_pivot_prominence_atr
         pivot_pair_lookback = 1 if rule is None else rule.pivot_pair_lookback
@@ -405,10 +425,17 @@ def _scan_symbol(
             "macd_hist": macd_hist,
         }
 
+        last_price = float(close.iloc[-1]) if not close.empty and pd.notna(close.iloc[-1]) else 0.0
+        indicator_min_move_map = {
+            "rsi": min_indicator_move,
+            "macd_hist": _macd_hist_effective_min_move(last_price, macd_hist_min_move_pct, min_indicator_move),
+        }
+
         for div_type in selected_divergence_types:
             indicator_direction_bullish = _direction_from_type(div_type) == "bullish"
             for indicator_name in selected_indicators:
                 indicator_series = indicator_map[indicator_name]
+                indicator_min_move = indicator_min_move_map[indicator_name]
                 pairs = find_divergences(
                 close,
                 indicator_series,
@@ -416,7 +443,7 @@ def _scan_symbol(
                     right=pivot_right,
                     max_gap_bars=pivot_gap,
                     min_price_move_pct=min_price_move,
-                    min_indicator_move=min_indicator_move,
+                    min_indicator_move=indicator_min_move,
                     divergence_type=div_type,  # type: ignore[arg-type]
                     lookaround_bars=lookaround,
                     enforce_unique_extreme=True,
@@ -470,7 +497,7 @@ def _scan_symbol(
                         macd_hist_slice,
                         regime_component=regime_component,
                         min_price_move_pct=min_price_move,
-                        min_indicator_move=min_indicator_move,
+                        min_indicator_move=indicator_min_move,
                     )
 
                     signals.append(

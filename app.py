@@ -22,8 +22,10 @@ from screener.config import (
     MA_REGIME_FILTER_MODE,
     MACD_SIGNAL,
     MACD_SLOW,
+    PIVOT_RIGHT_BARS,
     RSI_PERIOD,
     TIMEFRAMES,
+    TIMEFRAME_SCAN_RULES,
     USE_ADJUSTED_PRICES,
     USE_MA_REGIME_FILTER,
     USE_STRICT_INDICATOR_PIVOTS,
@@ -141,6 +143,8 @@ DISPLAY_COLUMN_ALIASES: dict[str, str] = {
     "ma_regime_timeframe": "MA regime timeframe",
     "signal_count": "signals found",
     "trade_side": "trade side",
+    "entry_time": "entry time (confirmed)",
+    "confirmation_lag_bars": "confirmation lag bars",
     "forward_return_pct": "forward return pct",
     "strategy_return_pct": "strategy return pct",
 }
@@ -488,6 +492,24 @@ def render_technical_chart(
     )
 
 
+_DIRECTION_BY_DIVERGENCE_TYPE: dict[str, float] = {
+    "regular_bullish": 1.0,
+    "regular_bearish": -1.0,
+    "hidden_bullish": 1.0,
+    "hidden_bearish": -1.0,
+}
+
+
+def _confirmation_lag_bars(timeframe: str) -> int:
+    # A pivot at pivot_b_time is only knowable `right` bars later, once the pivot
+    # detector has confirmed it as a local extreme (see _find_pivots in divergence.py).
+    # Entering a backtest trade at pivot_b_time's own close assumes a fill price that
+    # was not actually tradable yet, and captures part of the very reversal used to
+    # confirm the pivot - this look-ahead inflates win rate and average return.
+    rule = TIMEFRAME_SCAN_RULES.get(timeframe)
+    return rule.pivot_right_bars if rule is not None else PIVOT_RIGHT_BARS
+
+
 def _build_backtest_frame(history_results: pd.DataFrame, horizon_bars: int) -> pd.DataFrame:
     backtest_rows: list[dict[str, object]] = []
 
@@ -511,17 +533,17 @@ def _build_backtest_frame(history_results: pd.DataFrame, horizon_bars: int) -> p
         if signal_loc.size == 0 or signal_loc[0] < 0:
             continue
 
-        start_idx = int(signal_loc[0])
-        end_idx = start_idx + int(horizon_bars)
-        if end_idx >= len(candles):
+        confirmation_lag = _confirmation_lag_bars(str(row["timeframe"]))
+        entry_idx = int(signal_loc[0]) + confirmation_lag
+        end_idx = entry_idx + int(horizon_bars)
+        if entry_idx >= len(candles) or end_idx >= len(candles):
             continue
 
-        signal_close = float(candles.iloc[start_idx]["close"])
+        entry_time = candles.index[entry_idx]
+        entry_close = float(candles.iloc[entry_idx]["close"])
         future_close = float(candles.iloc[end_idx]["close"])
-        raw_return = (future_close / signal_close) - 1.0
-        direction = 1.0 if row["divergence_type"] == "regular_bullish" else -1.0
-        if str(row["divergence_type"]).startswith("hidden_"):
-            direction = 1.0 if str(row["divergence_type"]).endswith("bullish") else -1.0
+        raw_return = (future_close / entry_close) - 1.0
+        direction = _DIRECTION_BY_DIVERGENCE_TYPE.get(str(row["divergence_type"]), 1.0)
         strategy_return = raw_return * direction
         trade_side = "long" if direction > 0 else "short"
 
@@ -533,6 +555,8 @@ def _build_backtest_frame(history_results: pd.DataFrame, horizon_bars: int) -> p
                 "indicator": row["indicator"],
                 "trade_side": trade_side,
                 "signal_time": signal_time,
+                "entry_time": entry_time,
+                "confirmation_lag_bars": confirmation_lag,
                 "forward_return_pct": raw_return * 100.0,
                 "strategy_return_pct": strategy_return * 100.0,
                 "win": strategy_return > 0,
@@ -796,8 +820,11 @@ def main() -> None:
                     )
                     st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(summary))), width="stretch")
                     st.caption(
-                        "Forward return is raw price change after the signal. "
-                        "Strategy return applies signal direction: long keeps sign, short flips sign."
+                        "Entry is priced at the pivot's confirmation bar (pivot time + the timeframe's "
+                        "right-side pivot bars), not the pivot bar itself, since a pivot can't be identified "
+                        "as such until those confirmation bars have printed. Forward return is raw price change "
+                        "from entry over the backtest horizon. Strategy return applies signal direction: long "
+                        "keeps sign, short flips sign."
                     )
                     st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(backtest_df))), width="stretch")
                     st.caption("Divergence type guide")

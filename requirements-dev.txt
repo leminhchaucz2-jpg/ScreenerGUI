@@ -1,0 +1,9 @@
+# Development and testing dependencies (not required to run the app itself).
+-r requirements.txt
+
+pytest>=8.2.0
+
+# Only needed for browser-driven manual QA (see README "Development And Testing").
+# After installing, download the browser binary once:
+#   playwright install chromium
+playwright>=1.48.0
