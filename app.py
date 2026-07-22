@@ -820,6 +820,12 @@ def main() -> None:
             st.caption("Sorted by score — strongest setups first.")
             pretty_results = _pretty_dataframe(_format_pct_values(_format_currency_values(results)))
             st.dataframe(_style_score_column(pretty_results), width="stretch")
+            st.download_button(
+                "Download signals as CSV",
+                data=pretty_results.to_csv(index=False).encode("utf-8"),
+                file_name=f"{results['symbol'].iloc[0]}_signals.csv",
+                mime="text/csv",
+            )
 
             st.subheader("Chart Preview")
             hide_non_trading_gaps = st.checkbox(
@@ -924,7 +930,14 @@ def main() -> None:
                         "from entry over the backtest horizon. Strategy return applies signal direction: long "
                         "keeps sign, short flips sign."
                     )
-                    st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(backtest_df))), width="stretch")
+                    pretty_backtest = _pretty_dataframe(_format_pct_values(_format_currency_values(backtest_df)))
+                    st.dataframe(pretty_backtest, width="stretch")
+                    st.download_button(
+                        "Download backtest as CSV",
+                        data=pretty_backtest.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{backtest_df['symbol'].iloc[0]}_backtest.csv",
+                        mime="text/csv",
+                    )
     else:
         st.info(
             "Enter a symbol above, pick your timeframes, and click **Run Scan** to see divergence "
