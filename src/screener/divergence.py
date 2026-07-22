@@ -60,21 +60,26 @@ def _is_valid_divergence(
     return False
 
 
-def _pivot_prominence_ok(series: pd.Series, pivot_idx: int, is_low: bool, min_prominence_atr: float) -> bool:
-    if min_prominence_atr <= 0:
+def _pivot_prominence_ok(
+    atr_proxy_values: np.ndarray | None,
+    series_values: np.ndarray,
+    pivot_idx: int,
+    is_low: bool,
+    min_prominence_atr: float,
+) -> bool:
+    if min_prominence_atr <= 0 or atr_proxy_values is None:
         return True
 
-    if pivot_idx <= 0 or pivot_idx >= len(series) - 1:
+    if pivot_idx <= 0 or pivot_idx >= len(series_values) - 1:
         return False
 
-    atr_proxy = series.diff().abs().rolling(window=14, min_periods=14).mean()
-    atr_value = atr_proxy.iloc[pivot_idx]
-    if pd.isna(atr_value) or atr_value <= 0:
+    atr_value = atr_proxy_values[pivot_idx]
+    if np.isnan(atr_value) or atr_value <= 0:
         return True
 
-    center = float(series.iloc[pivot_idx])
-    left = float(series.iloc[pivot_idx - 1])
-    right = float(series.iloc[pivot_idx + 1])
+    center = float(series_values[pivot_idx])
+    left = float(series_values[pivot_idx - 1])
+    right = float(series_values[pivot_idx + 1])
 
     if is_low:
         local_contrast = min(left - center, right - center)
@@ -96,6 +101,14 @@ def _find_pivots(
     values = series.values
     pivots = np.full(len(values), False)
 
+    # Computed once for the whole series instead of per-candidate-bar: the prior
+    # per-bar recompute made pivot scanning O(n^2) on long histories (e.g. "1d"/"max").
+    atr_proxy_values = (
+        series.diff().abs().rolling(window=14, min_periods=14).mean().to_numpy()
+        if min_prominence_atr > 0
+        else None
+    )
+
     for i in range(left, len(values) - right):
         window = values[i - left : i + right + 1]
         center = values[i]
@@ -105,9 +118,9 @@ def _find_pivots(
         if enforce_unique_extreme and np.sum(window == center) > 1:
             continue
 
-        if is_low and center == np.min(window) and _pivot_prominence_ok(series, i, is_low=True, min_prominence_atr=min_prominence_atr):
+        if is_low and center == np.min(window) and _pivot_prominence_ok(atr_proxy_values, values, i, is_low=True, min_prominence_atr=min_prominence_atr):
             pivots[i] = True
-        if not is_low and center == np.max(window) and _pivot_prominence_ok(series, i, is_low=False, min_prominence_atr=min_prominence_atr):
+        if not is_low and center == np.max(window) and _pivot_prominence_ok(atr_proxy_values, values, i, is_low=False, min_prominence_atr=min_prominence_atr):
             pivots[i] = True
 
     return pd.Series(pivots, index=series.index)
