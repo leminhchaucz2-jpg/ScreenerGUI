@@ -368,11 +368,23 @@ def render_technical_chart(
         f". Displaying last {len(candles)} candles for performance."
     )
 
+    # Indicators are computed on the full price history, then sliced down to the
+    # displayed window - not recomputed on the truncated tail. RSI/MACD/SMA carry
+    # "memory" from all prior bars (Wilder smoothing, EMAs), so computing them fresh
+    # on just the visible slice shifts their warm-up trajectory and can drift several
+    # points away from the values the scanner used, making signal overlays land off
+    # the plotted line.
+    full_close = full_candles["close"]
+    full_rsi = compute_rsi(full_close, period=RSI_PERIOD)
+    full_macd = compute_macd(full_close, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
+    full_sma_50 = compute_sma(full_close, period=50)
+    full_sma_200 = compute_sma(full_close, period=200)
+
     close = candles["close"]
-    rsi = compute_rsi(close, period=RSI_PERIOD)
-    macd = compute_macd(close, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
-    sma_50 = compute_sma(close, period=50)
-    sma_200 = compute_sma(close, period=200)
+    rsi = full_rsi.loc[candles.index]
+    macd = full_macd.loc[candles.index]
+    sma_50 = full_sma_50.loc[candles.index]
+    sma_200 = full_sma_200.loc[candles.index]
 
     fig = make_subplots(
         rows=3,
