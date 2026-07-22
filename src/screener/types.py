@@ -30,6 +30,12 @@ class DivergenceSignal:
     score_components: dict[str, int]
     score: int
     note: str
+    atr: float | None = None
+    atr_pct: float | None = None
+    bb_percent_b: float | None = None
+    adx: float | None = None
+    plus_di: float | None = None
+    minus_di: float | None = None
 
 
 @dataclass(frozen=True)

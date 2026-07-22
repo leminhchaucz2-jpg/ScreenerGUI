@@ -38,6 +38,9 @@ scan_universe = screener_scanner.scan_universe
 scan_universe_history = getattr(screener_scanner, "scan_universe_history", screener_scanner.scan_universe)
 compute_macd = screener_indicators.compute_macd
 compute_rsi = screener_indicators.compute_rsi
+compute_stoch_rsi = screener_indicators.compute_stoch_rsi
+compute_obv = screener_indicators.compute_obv
+compute_cci = screener_indicators.compute_cci
 compute_sma = getattr(
     screener_indicators,
     "compute_sma",
@@ -141,6 +144,12 @@ DISPLAY_COLUMN_ALIASES: dict[str, str] = {
     "pivot_gap_bars": "bars between pivots",
     "ma_regime": "MA regime",
     "ma_regime_timeframe": "MA regime timeframe",
+    "atr": "ATR (14)",
+    "atr_pct": "ATR pct of price",
+    "bb_percent_b": "Bollinger %B",
+    "adx": "ADX (14)",
+    "plus_di": "+DI",
+    "minus_di": "-DI",
     "signal_count": "signals found",
     "trade_side": "trade side",
     "entry_time": "entry time (confirmed)",
@@ -243,8 +252,8 @@ def _build_market_rangebreaks(candles: pd.DataFrame, timeframe: str, *, hide_non
 
 def _add_divergence_overlays(
     fig: go.Figure,
-    rsi: pd.Series,
-    macd: pd.DataFrame,
+    indicator_series_map: dict[str, pd.Series],
+    indicator_row_map: dict[str, int],
     signal_row: pd.Series,
     *,
     emphasize: bool = False,
@@ -281,12 +290,9 @@ def _add_divergence_overlays(
     fig.add_vline(x=a_time, line_dash="dot", line_color=price_color, opacity=0.25 if not emphasize else 0.45)
     fig.add_vline(x=b_time, line_dash="dot", line_color=price_color, opacity=0.45 if not emphasize else 0.75)
 
-    if signal_row["indicator"] == "rsi":
-        indicator_series = rsi
-        indicator_row = 2
-    else:
-        indicator_series = macd["macd_hist"]
-        indicator_row = 3
+    indicator_name = str(signal_row["indicator"])
+    indicator_series = indicator_series_map.get(indicator_name)
+    indicator_row = indicator_row_map.get(indicator_name, 3)
 
     indicator_a_time = _as_timestamp(signal_row["indicator_a_time"]) if "indicator_a_time" in signal_row else a_time
     indicator_b_time = _as_timestamp(signal_row["indicator_b_time"]) if "indicator_b_time" in signal_row else b_time
@@ -379,20 +385,63 @@ def render_technical_chart(
     full_macd = compute_macd(full_close, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
     full_sma_50 = compute_sma(full_close, period=50)
     full_sma_200 = compute_sma(full_close, period=200)
+    full_stoch_rsi_k = compute_stoch_rsi(full_close)["stoch_rsi_k"]
+    full_cci = compute_cci(full_candles["high"], full_candles["low"], full_close)
+    full_obv = compute_obv(full_close, full_candles["volume"])
 
     close = candles["close"]
     rsi = full_rsi.loc[candles.index]
     macd = full_macd.loc[candles.index]
     sma_50 = full_sma_50.loc[candles.index]
     sma_200 = full_sma_200.loc[candles.index]
+    stoch_rsi_k = full_stoch_rsi_k.loc[candles.index]
+    cci = full_cci.loc[candles.index]
+    obv = full_obv.loc[candles.index]
+
+    # Only add dedicated panels for indicators actually present in the signals being
+    # charted - CCI and OBV are on scales incompatible with the RSI/MACD panels, so
+    # they need their own row rather than sharing one.
+    indicators_present: set[str] = set()
+    if all_signal_rows is not None and not all_signal_rows.empty and "indicator" in all_signal_rows.columns:
+        indicators_present.update(str(v) for v in all_signal_rows["indicator"].dropna().unique())
+    if signal_row is not None and "indicator" in signal_row:
+        indicators_present.add(str(signal_row["indicator"]))
+    if not indicators_present:
+        indicators_present = {"rsi", "macd_hist"}
+
+    show_cci = "cci" in indicators_present
+    show_obv = "obv" in indicators_present
+
+    panel_titles = ["Price", "RSI / Stoch RSI", "MACD"]
+    row_heights = [0.5, 0.16, 0.16]
+    row_of = {"rsi": 2, "stoch_rsi": 2, "macd_hist": 3}
+    next_row = 4
+    if show_cci:
+        panel_titles.append("CCI")
+        row_heights.append(0.09)
+        row_of["cci"] = next_row
+        next_row += 1
+    if show_obv:
+        panel_titles.append("OBV")
+        row_heights.append(0.09)
+        row_of["obv"] = next_row
+        next_row += 1
+
+    indicator_series_map = {
+        "rsi": rsi,
+        "stoch_rsi": stoch_rsi_k,
+        "macd_hist": macd["macd_hist"],
+        "cci": cci,
+        "obv": obv,
+    }
 
     fig = make_subplots(
-        rows=3,
+        rows=len(panel_titles),
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.04,
-        row_heights=[0.58, 0.20, 0.22],
-        subplot_titles=("Price", "RSI", "MACD"),
+        row_heights=row_heights,
+        subplot_titles=tuple(panel_titles),
     )
     fig.add_trace(
         go.Candlestick(
@@ -428,6 +477,17 @@ def render_technical_chart(
         row=2,
         col=1,
     )
+    fig.add_trace(
+        go.Scatter(
+            x=candles.index,
+            y=stoch_rsi_k,
+            mode="lines",
+            name="Stoch RSI %K",
+            line={"color": "#e377c2", "width": 1.2, "dash": "dot"},
+        ),
+        row=2,
+        col=1,
+    )
     fig.add_hline(y=70, line_dash="dash", line_color="#d62728", row=2, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="#2ca02c", row=2, col=1)
 
@@ -454,6 +514,22 @@ def render_technical_chart(
         col=1,
     )
 
+    if show_cci:
+        fig.add_trace(
+            go.Scatter(x=candles.index, y=cci, mode="lines", name="CCI", line={"color": "#8c564b", "width": 1.4}),
+            row=row_of["cci"],
+            col=1,
+        )
+        fig.add_hline(y=100, line_dash="dash", line_color="#d62728", row=row_of["cci"], col=1)
+        fig.add_hline(y=-100, line_dash="dash", line_color="#2ca02c", row=row_of["cci"], col=1)
+
+    if show_obv:
+        fig.add_trace(
+            go.Scatter(x=candles.index, y=obv, mode="lines", name="OBV", line={"color": "#17becf", "width": 1.4}),
+            row=row_of["obv"],
+            col=1,
+        )
+
     _add_sma_cross_markers(fig, candles, sma_50, sma_200)
 
     if visible_signal_rows is not None and not visible_signal_rows.empty:
@@ -465,9 +541,9 @@ def render_technical_chart(
                 and row["indicator"] == signal_row["indicator"]
                 and row["divergence_type"] == signal_row["divergence_type"]
             )
-            _add_divergence_overlays(fig, rsi, macd, row, emphasize=is_selected)
+            _add_divergence_overlays(fig, indicator_series_map, row_of, row, emphasize=is_selected)
     elif signal_row is not None:
-        _add_divergence_overlays(fig, rsi, macd, signal_row, emphasize=True)
+        _add_divergence_overlays(fig, indicator_series_map, row_of, signal_row, emphasize=True)
 
     fig.update_layout(
         title=f"{symbol} - {timeframe} Technical View",
@@ -496,6 +572,10 @@ def render_technical_chart(
     fig.update_yaxes(title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
     fig.update_yaxes(title_text="MACD", row=3, col=1)
+    if show_cci:
+        fig.update_yaxes(title_text="CCI", row=row_of["cci"], col=1)
+    if show_obv:
+        fig.update_yaxes(title_text="OBV", row=row_of["obv"], col=1)
     st.plotly_chart(
         fig,
         width="stretch",
@@ -606,7 +686,7 @@ def main() -> None:
             )
             selected_indicators = st.multiselect(
                 "Indicators",
-                options=["rsi", "macd_hist"],
+                options=["rsi", "macd_hist", "stoch_rsi", "obv", "cci"],
                 default=list(DEFAULT_ENABLED_INDICATORS),
                 format_func=_humanize_text,
                 help="Which indicator(s) to compare against price when looking for divergence.",
@@ -864,6 +944,9 @@ def main() -> None:
                         "pivot gap bars": row.get("pivot_gap_bars"),
                         "ma regime": _humanize_text(row.get("ma_regime")),
                         "ma regime timeframe": _humanize_text(row.get("ma_regime_timeframe")),
+                        "atr": row.get("atr"),
+                        "adx": row.get("adx"),
+                        "bollinger %b": row.get("bb_percent_b"),
                         "score": row.get("score"),
                     }
                 ]

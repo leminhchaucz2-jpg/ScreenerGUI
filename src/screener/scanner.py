@@ -9,6 +9,12 @@ from typing import Callable
 import pandas as pd
 
 from .config import (
+    ADX_PERIOD,
+    ATR_PERIOD,
+    BOLLINGER_NUM_STD,
+    BOLLINGER_PERIOD,
+    CCI_MIN_INDICATOR_MOVE,
+    CCI_PERIOD,
     DEFAULT_ENABLED_DIVERGENCE_TYPES,
     DEFAULT_ENABLED_INDICATORS,
     DEDUP_BY_SIGNAL_TIME,
@@ -24,10 +30,14 @@ from .config import (
     MIN_BARS_REQUIRED,
     MIN_INDICATOR_MOVE,
     MIN_PRICE_MOVE_PCT,
+    OBV_MIN_MOVE_PCT_OF_AVG_VOLUME,
     PIVOT_LEFT_BARS,
     PIVOT_MAX_GAP_BARS,
     PIVOT_RIGHT_BARS,
     RSI_PERIOD,
+    STOCH_RSI_PERIOD,
+    STOCH_RSI_SMOOTH_D,
+    STOCH_RSI_SMOOTH_K,
     TIMEFRAMES,
     TIMEFRAME_SCAN_RULES,
     TIMEFRAME_WEIGHTS,
@@ -42,11 +52,20 @@ from .types import DivergenceSignal
 
 compute_macd = indicator_lib.compute_macd
 compute_rsi = indicator_lib.compute_rsi
+compute_atr = indicator_lib.compute_atr
+compute_stoch_rsi = indicator_lib.compute_stoch_rsi
+compute_obv = indicator_lib.compute_obv
+compute_cci = indicator_lib.compute_cci
+compute_bollinger_bands = indicator_lib.compute_bollinger_bands
+compute_adx = indicator_lib.compute_adx
 compute_sma = getattr(
     indicator_lib,
     "compute_sma",
     lambda close, period: close.rolling(window=period, min_periods=period).mean(),
 )
+
+_BOUNDED_OSCILLATORS = {"rsi", "stoch_rsi"}
+_ZERO_CROSS_OSCILLATORS = {"macd_hist", "cci"}
 
 _CANDLE_CACHE: dict[tuple[object, ...], pd.DataFrame] = {}
 
@@ -121,28 +140,29 @@ def _combined_ma_regime(regime_by_tf: dict[str, str]) -> str:
 def _confirmation_bonus(
     indicator_name: str,
     bullish: bool,
-    rsi_slice: pd.Series,
-    macd_hist_slice: pd.Series,
+    indicator_slice: pd.Series,
 ) -> int:
-    if indicator_name == "rsi":
-        if len(rsi_slice) < 2:
-            return 0
-        prev = float(rsi_slice.iloc[-2])
-        curr = float(rsi_slice.iloc[-1])
+    if len(indicator_slice) < 2:
+        return 0
+    prev = float(indicator_slice.iloc[-2])
+    curr = float(indicator_slice.iloc[-1])
+
+    if indicator_name in _BOUNDED_OSCILLATORS:
         if bullish and prev <= 30 < curr:
             return 1
         if (not bullish) and prev >= 70 > curr:
             return 1
         return 0
 
-    if len(macd_hist_slice) < 2:
+    if indicator_name in _ZERO_CROSS_OSCILLATORS:
+        if bullish and prev < 0 <= curr:
+            return 1
+        if (not bullish) and prev > 0 >= curr:
+            return 1
         return 0
-    prev = float(macd_hist_slice.iloc[-2])
-    curr = float(macd_hist_slice.iloc[-1])
-    if bullish and prev < 0 <= curr:
-        return 1
-    if (not bullish) and prev > 0 >= curr:
-        return 1
+
+    # OBV and other unbounded, non-oscillating indicators have no natural
+    # overbought/zero-cross confirmation level.
     return 0
 
 
@@ -163,15 +183,14 @@ def _score_signal(
     pair: PivotPair,
     bullish: bool,
     price_slice: pd.Series,
-    rsi_slice: pd.Series,
-    macd_hist_slice: pd.Series,
+    indicator_slice: pd.Series,
     regime_component: int,
     min_price_move_pct: float,
     min_indicator_move: float,
 ) -> tuple[int, dict[str, int]]:
     components: dict[str, int] = {
         "timeframe_weight": TIMEFRAME_WEIGHTS[timeframe],
-        "indicator_confirmation": _confirmation_bonus(indicator_name, bullish, rsi_slice, macd_hist_slice),
+        "indicator_confirmation": _confirmation_bonus(indicator_name, bullish, indicator_slice),
         "price_impulse": _latest_return_bonus(price_slice, bullish),
         "price_strength": 1 if pair.price_move_pct >= (min_price_move_pct * 1.75) else 0,
         "indicator_strength": 1 if pair.indicator_move >= (min_indicator_move * 1.5) else 0,
@@ -203,6 +222,23 @@ def _macd_hist_effective_min_move(
     return fallback_min_indicator_move
 
 
+def _obv_effective_min_move(
+    avg_volume: float,
+    obv_min_move_pct_of_avg_volume: float,
+    fallback_min_indicator_move: float,
+) -> float:
+    """Scale the OBV move threshold by the symbol's own recent average bar volume.
+
+    OBV is a running sum of signed volume with no natural bound, unlike RSI's
+    0-100 scale, so a fixed absolute threshold would under-filter high-volume
+    names and over-filter thinly traded ones. Falls back to the absolute
+    threshold if volume data is unusable.
+    """
+    if avg_volume > 0:
+        return (obv_min_move_pct_of_avg_volume / 100.0) * avg_volume
+    return fallback_min_indicator_move
+
+
 def _filter_divergence_types(divergence_types: list[str] | None) -> list[DivergenceType]:
     supported = {
         "regular_bullish",
@@ -220,9 +256,12 @@ def _filter_divergence_types(divergence_types: list[str] | None) -> list[Diverge
     return [d for d in output if d in supported]
 
 
+_SUPPORTED_DIVERGENCE_INDICATORS = {"rsi", "macd_hist", "stoch_rsi", "obv", "cci"}
+
+
 def _filter_indicators(indicators: list[str] | None) -> list[str]:
     requested = DEFAULT_ENABLED_INDICATORS if indicators is None else indicators
-    return [name for name in requested if name in {"rsi", "macd_hist"}]
+    return [name for name in requested if name in _SUPPORTED_DIVERGENCE_INDICATORS]
 
 
 def _pick_stronger_signal(a: DivergenceSignal, b: DivergenceSignal) -> DivergenceSignal:
@@ -419,16 +458,36 @@ def _scan_symbol(
         macd_hist = macd_df["macd_hist"]
         sma_50 = compute_sma(close, period=50)
         sma_200 = compute_sma(close, period=200)
+        atr = compute_atr(candles["high"], candles["low"], close, period=ATR_PERIOD)
+        stoch_rsi_k = compute_stoch_rsi(
+            close,
+            rsi_period=STOCH_RSI_PERIOD,
+            stoch_period=STOCH_RSI_PERIOD,
+            smooth_k=STOCH_RSI_SMOOTH_K,
+            smooth_d=STOCH_RSI_SMOOTH_D,
+        )["stoch_rsi_k"]
+        obv = compute_obv(close, candles["volume"])
+        cci = compute_cci(candles["high"], candles["low"], close, period=CCI_PERIOD)
+        bollinger = compute_bollinger_bands(close, period=BOLLINGER_PERIOD, num_std=BOLLINGER_NUM_STD)
+        adx_df = compute_adx(candles["high"], candles["low"], close, period=ADX_PERIOD)
 
         indicator_map = {
             "rsi": rsi,
             "macd_hist": macd_hist,
+            "stoch_rsi": stoch_rsi_k,
+            "obv": obv,
+            "cci": cci,
         }
 
         last_price = float(close.iloc[-1]) if not close.empty and pd.notna(close.iloc[-1]) else 0.0
+        avg_volume = candles["volume"].rolling(window=50, min_periods=10).mean()
+        last_avg_volume = float(avg_volume.iloc[-1]) if not avg_volume.empty and pd.notna(avg_volume.iloc[-1]) else 0.0
         indicator_min_move_map = {
             "rsi": min_indicator_move,
             "macd_hist": _macd_hist_effective_min_move(last_price, macd_hist_min_move_pct, min_indicator_move),
+            "stoch_rsi": min_indicator_move,
+            "cci": CCI_MIN_INDICATOR_MOVE,
+            "obv": _obv_effective_min_move(last_avg_volume, OBV_MIN_MOVE_PCT_OF_AVG_VOLUME, min_indicator_move),
         }
 
         for div_type in selected_divergence_types:
@@ -465,8 +524,7 @@ def _scan_symbol(
                         continue
 
                     close_slice = close.iloc[: int(signal_idx) + 1]
-                    rsi_slice = rsi.iloc[: int(signal_idx) + 1]
-                    macd_hist_slice = macd_hist.iloc[: int(signal_idx) + 1]
+                    indicator_slice = indicator_series.iloc[: int(signal_idx) + 1]
 
                     sma_50_slice = sma_50.iloc[: int(signal_idx) + 1]
                     sma_200_slice = sma_200.iloc[: int(signal_idx) + 1]
@@ -474,6 +532,19 @@ def _scan_symbol(
 
                     latest_sma_50 = _safe_float_at(sma_50, signal_time)
                     latest_sma_200 = _safe_float_at(sma_200, signal_time)
+
+                    latest_atr = _safe_float_at(atr, signal_time)
+                    signal_price = _safe_float_at(close, signal_time)
+                    latest_atr_pct = (
+                        (latest_atr / signal_price) * 100.0
+                        if latest_atr is not None and signal_price
+                        else None
+                    )
+
+                    latest_bb_percent_b = _safe_float_at(bollinger["bb_percent_b"], signal_time)
+                    latest_adx = _safe_float_at(adx_df["adx"], signal_time)
+                    latest_plus_di = _safe_float_at(adx_df["plus_di"], signal_time)
+                    latest_minus_di = _safe_float_at(adx_df["minus_di"], signal_time)
 
                     regime_state, regime_source = _regime_at_signal_time(regime_context, signal_time)
                     if use_ma_regime_filter:
@@ -493,8 +564,7 @@ def _scan_symbol(
                         pair,
                         indicator_direction_bullish,
                         close_slice,
-                        rsi_slice,
-                        macd_hist_slice,
+                        indicator_slice,
                         regime_component=regime_component,
                         min_price_move_pct=min_price_move,
                         min_indicator_move=indicator_min_move,
@@ -523,6 +593,12 @@ def _scan_symbol(
                             sma_cross_time=sma_cross_time.to_pydatetime() if sma_cross_time is not None else None,
                             ma_regime=regime_state,
                             ma_regime_timeframe=regime_source,
+                            atr=latest_atr,
+                            atr_pct=latest_atr_pct,
+                            bb_percent_b=latest_bb_percent_b,
+                            adx=latest_adx,
+                            plus_di=latest_plus_di,
+                            minus_di=latest_minus_di,
                             score_components=score_components,
                             score=score,
                             note="Pivot divergence with causal score",
@@ -588,6 +664,12 @@ def scan_universe(
                 "sma_cross_time",
                 "ma_regime",
                 "ma_regime_timeframe",
+                "atr",
+                "atr_pct",
+                "bb_percent_b",
+                "adx",
+                "plus_di",
+                "minus_di",
                 "score_components",
                 "score",
                 "note",
@@ -651,6 +733,12 @@ def scan_universe_history(
                 "sma_cross_time",
                 "ma_regime",
                 "ma_regime_timeframe",
+                "atr",
+                "atr_pct",
+                "bb_percent_b",
+                "adx",
+                "plus_di",
+                "minus_di",
                 "score_components",
                 "score",
                 "note",
