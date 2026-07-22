@@ -318,46 +318,27 @@ def _add_sma_cross_markers(fig: go.Figure, candles: pd.DataFrame, sma_50: pd.Ser
     golden_events = cross_df[(prev <= 0) & (diff > 0)]
     death_events = cross_df[(prev >= 0) & (diff < 0)]
 
-    for event_time in golden_events.index:
-        if event_time not in candles.index:
-            continue
-        close_price = float(candles.loc[event_time, "close"])
+    def _add_cross_trace(events: pd.DataFrame, *, label: str, symbol: str, color: str) -> None:
+        event_times = [t for t in events.index if t in candles.index]
+        if not event_times:
+            return
+        close_prices = [float(candles.loc[t, "close"]) for t in event_times]
         fig.add_trace(
             go.Scatter(
-                x=[event_time],
-                y=[close_price],
+                x=event_times,
+                y=close_prices,
                 mode="markers+text",
-                text=["Golden Cross"],
+                text=[label] * len(event_times),
                 textposition="top center",
-                name="Golden Cross",
-                marker={"symbol": "x", "size": 13, "color": "#2ca02c", "line": {"width": 2, "color": "#2ca02c"}},
+                name=label,
+                marker={"symbol": symbol, "size": 13, "color": color, "line": {"width": 2, "color": color}},
             ),
             row=1,
             col=1,
         )
 
-    for event_time in death_events.index:
-        if event_time not in candles.index:
-            continue
-        close_price = float(candles.loc[event_time, "close"])
-        fig.add_trace(
-            go.Scatter(
-                x=[event_time],
-                y=[close_price],
-                mode="markers+text",
-                text=["Death Cross"],
-                textposition="top center",
-                name="Death Cross",
-                marker={
-                    "symbol": "triangle-down",
-                    "size": 13,
-                    "color": "#d62728",
-                    "line": {"width": 1, "color": "#d62728"},
-                },
-            ),
-            row=1,
-            col=1,
-        )
+    _add_cross_trace(golden_events, label="Golden Cross", symbol="x", color="#2ca02c")
+    _add_cross_trace(death_events, label="Death Cross", symbol="triangle-down", color="#d62728")
 
 
 def render_technical_chart(
@@ -397,7 +378,7 @@ def render_technical_chart(
         shared_xaxes=True,
         vertical_spacing=0.04,
         row_heights=[0.58, 0.20, 0.22],
-        subplot_titles=(f"{symbol} - {timeframe}", "RSI", "MACD"),
+        subplot_titles=("Price", "RSI", "MACD"),
     )
     fig.add_trace(
         go.Candlestick(
@@ -490,8 +471,9 @@ def render_technical_chart(
     )
     if hide_non_trading_gaps and timeframe in {"1h", "4h"}:
         # Category axis removes timeline gaps without relying on timezone-sensitive
-        # datetime rangebreak filtering.
-        fig.update_xaxes(type="category")
+        # datetime rangebreak filtering. nticks keeps labels readable instead of
+        # printing every bar's timestamp.
+        fig.update_xaxes(type="category", tickangle=-45, nticks=20)
     else:
         fig.update_xaxes(
             range=[candles.index.min(), candles.index.max()],
