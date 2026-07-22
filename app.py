@@ -322,11 +322,13 @@ def _add_sma_cross_markers(fig: go.Figure, candles: pd.DataFrame, sma_50: pd.Ser
         event_times = [t for t in events.index if t in candles.index]
         if not event_times:
             return
-        close_prices = [float(candles.loc[t, "close"]) for t in event_times]
+        # Plot at the SMA intersection itself (avg of the two MAs at the cross bar),
+        # not the candle's close, so the marker sits where the lines actually cross.
+        cross_levels = [float(events.loc[t, ["sma_50", "sma_200"]].mean()) for t in event_times]
         fig.add_trace(
             go.Scatter(
                 x=event_times,
-                y=close_prices,
+                y=cross_levels,
                 mode="markers+text",
                 text=[label] * len(event_times),
                 textposition="top center",
