@@ -205,6 +205,25 @@ def _format_currency_values(frame: pd.DataFrame) -> pd.DataFrame:
     return formatted
 
 
+def _style_score_column(frame: pd.DataFrame, score_col: str = "score"):
+    if frame.empty or score_col not in frame.columns:
+        return frame
+
+    scores = pd.to_numeric(frame[score_col], errors="coerce")
+    min_score, max_score = scores.min(), scores.max()
+    span = max(max_score - min_score, 1e-9)
+
+    def _color(value: object) -> str:
+        score = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.isna(score):
+            return ""
+        intensity = (score - min_score) / span
+        alpha = 0.15 + 0.55 * intensity
+        return f"background-color: rgba(46, 163, 96, {alpha:.2f})"
+
+    return frame.style.map(_color, subset=[score_col])
+
+
 def _build_market_rangebreaks(candles: pd.DataFrame, timeframe: str, *, hide_non_trading_gaps: bool) -> list[dict[str, object]]:
     if not hide_non_trading_gaps:
         return []
@@ -299,46 +318,29 @@ def _add_sma_cross_markers(fig: go.Figure, candles: pd.DataFrame, sma_50: pd.Ser
     golden_events = cross_df[(prev <= 0) & (diff > 0)]
     death_events = cross_df[(prev >= 0) & (diff < 0)]
 
-    for event_time in golden_events.index:
-        if event_time not in candles.index:
-            continue
-        close_price = float(candles.loc[event_time, "close"])
+    def _add_cross_trace(events: pd.DataFrame, *, label: str, symbol: str, color: str) -> None:
+        event_times = [t for t in events.index if t in candles.index]
+        if not event_times:
+            return
+        # Plot at the SMA intersection itself (avg of the two MAs at the cross bar),
+        # not the candle's close, so the marker sits where the lines actually cross.
+        cross_levels = [float(events.loc[t, ["sma_50", "sma_200"]].mean()) for t in event_times]
         fig.add_trace(
             go.Scatter(
-                x=[event_time],
-                y=[close_price],
+                x=event_times,
+                y=cross_levels,
                 mode="markers+text",
-                text=["Golden Cross"],
+                text=[label] * len(event_times),
                 textposition="top center",
-                name="Golden Cross",
-                marker={"symbol": "x", "size": 13, "color": "#2ca02c", "line": {"width": 2, "color": "#2ca02c"}},
+                name=label,
+                marker={"symbol": symbol, "size": 13, "color": color, "line": {"width": 2, "color": color}},
             ),
             row=1,
             col=1,
         )
 
-    for event_time in death_events.index:
-        if event_time not in candles.index:
-            continue
-        close_price = float(candles.loc[event_time, "close"])
-        fig.add_trace(
-            go.Scatter(
-                x=[event_time],
-                y=[close_price],
-                mode="markers+text",
-                text=["Death Cross"],
-                textposition="top center",
-                name="Death Cross",
-                marker={
-                    "symbol": "triangle-down",
-                    "size": 13,
-                    "color": "#d62728",
-                    "line": {"width": 1, "color": "#d62728"},
-                },
-            ),
-            row=1,
-            col=1,
-        )
+    _add_cross_trace(golden_events, label="Golden Cross", symbol="x", color="#2ca02c")
+    _add_cross_trace(death_events, label="Death Cross", symbol="triangle-down", color="#d62728")
 
 
 def render_technical_chart(
@@ -366,11 +368,23 @@ def render_technical_chart(
         f". Displaying last {len(candles)} candles for performance."
     )
 
+    # Indicators are computed on the full price history, then sliced down to the
+    # displayed window - not recomputed on the truncated tail. RSI/MACD/SMA carry
+    # "memory" from all prior bars (Wilder smoothing, EMAs), so computing them fresh
+    # on just the visible slice shifts their warm-up trajectory and can drift several
+    # points away from the values the scanner used, making signal overlays land off
+    # the plotted line.
+    full_close = full_candles["close"]
+    full_rsi = compute_rsi(full_close, period=RSI_PERIOD)
+    full_macd = compute_macd(full_close, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
+    full_sma_50 = compute_sma(full_close, period=50)
+    full_sma_200 = compute_sma(full_close, period=200)
+
     close = candles["close"]
-    rsi = compute_rsi(close, period=RSI_PERIOD)
-    macd = compute_macd(close, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL)
-    sma_50 = compute_sma(close, period=50)
-    sma_200 = compute_sma(close, period=200)
+    rsi = full_rsi.loc[candles.index]
+    macd = full_macd.loc[candles.index]
+    sma_50 = full_sma_50.loc[candles.index]
+    sma_200 = full_sma_200.loc[candles.index]
 
     fig = make_subplots(
         rows=3,
@@ -378,7 +392,7 @@ def render_technical_chart(
         shared_xaxes=True,
         vertical_spacing=0.04,
         row_heights=[0.58, 0.20, 0.22],
-        subplot_titles=(f"{symbol} - {timeframe}", "RSI", "MACD"),
+        subplot_titles=("Price", "RSI", "MACD"),
     )
     fig.add_trace(
         go.Candlestick(
@@ -471,8 +485,9 @@ def render_technical_chart(
     )
     if hide_non_trading_gaps and timeframe in {"1h", "4h"}:
         # Category axis removes timeline gaps without relying on timezone-sensitive
-        # datetime rangebreak filtering.
-        fig.update_xaxes(type="category")
+        # datetime rangebreak filtering. nticks keeps labels readable instead of
+        # printing every bar's timestamp.
+        fig.update_xaxes(type="category", tickangle=-45, nticks=20)
     else:
         fig.update_xaxes(
             range=[candles.index.min(), candles.index.max()],
@@ -574,6 +589,95 @@ def main() -> None:
     if "symbol_input" not in st.session_state:
         st.session_state.symbol_input = "AAPL"
 
+    with st.sidebar:
+        st.header("Scan Settings")
+
+        with st.expander("Divergence & Indicators", expanded=True):
+            st.caption(
+                "Divergence is when price and an indicator move in different directions — "
+                "often an early sign of a reversal or continuation."
+            )
+            divergence_types = st.multiselect(
+                "Divergence types",
+                options=["regular_bullish", "regular_bearish", "hidden_bullish", "hidden_bearish"],
+                default=list(DEFAULT_ENABLED_DIVERGENCE_TYPES),
+                format_func=_humanize_text,
+                help="Which divergence patterns to scan for. See the guide below for what each means.",
+            )
+            selected_indicators = st.multiselect(
+                "Indicators",
+                options=["rsi", "macd_hist"],
+                default=list(DEFAULT_ENABLED_INDICATORS),
+                format_func=_humanize_text,
+                help="Which indicator(s) to compare against price when looking for divergence.",
+            )
+            st.markdown(
+                "- **Regular bullish**: price makes a lower low while the indicator makes a "
+                "higher low (possible upside reversal).\n"
+                "- **Regular bearish**: price makes a higher high while the indicator makes a "
+                "lower high (possible downside reversal).\n"
+                "- **Hidden bullish**: price makes a higher low while the indicator makes a "
+                "lower low (bullish continuation bias).\n"
+                "- **Hidden bearish**: price makes a lower high while the indicator makes a "
+                "higher high (bearish continuation bias)."
+            )
+
+        with st.expander("MA Regime Filter"):
+            use_ma_regime_filter = st.checkbox(
+                "Use MA regime filter (daily/weekly)",
+                value=USE_MA_REGIME_FILTER,
+                help=(
+                    "Only keep signals that agree with the broader trend (50/200 moving "
+                    "averages on daily and weekly candles). Reduces reversal signals taken "
+                    "against a strong prevailing trend."
+                ),
+            )
+            ma_regime_filter_mode = st.selectbox(
+                "MA regime mode",
+                options=["soft", "hard"],
+                index=0 if MA_REGIME_FILTER_MODE == "soft" else 1,
+                help="Soft: reject only direct regime opposition. Hard: require exact regime alignment.",
+            )
+
+        with st.expander("Signal Precision"):
+            strict_indicator_pivots = st.checkbox(
+                "Strict indicator pivots (require indicator swing pivots)",
+                value=USE_STRICT_INDICATOR_PIVOTS,
+                help=(
+                    "When on, the indicator (RSI or MACD histogram) must form its own "
+                    "independent swing high/low at the same point as the price pivot. Filters "
+                    "out weaker setups, but finds fewer signals overall."
+                ),
+            )
+
+        with st.expander("Backtest"):
+            backtest_enabled = st.checkbox("Show historical backtest", value=True)
+            backtest_horizon = st.number_input(
+                "Backtest horizon (bars)",
+                min_value=1,
+                max_value=50,
+                value=10,
+                step=1,
+            )
+
+        with st.expander("Chart Display"):
+            chart_max_bars = st.number_input(
+                "Chart bars to display",
+                min_value=200,
+                max_value=5000,
+                value=800,
+                step=100,
+            )
+
+        with st.expander("Cache Management"):
+            if st.button("Clear price cache"):
+                _load_price_cached.clear()
+                st.success("Price cache cleared. Run Scan again to reload full history.")
+            if st.button("Clear scanner cache"):
+                if hasattr(screener_scanner, "clear_candle_cache"):
+                    screener_scanner.clear_candle_cache()
+                st.success("Scanner candle cache cleared. Run Scan again to reload fresh candles.")
+
     col1, col2 = st.columns([2, 1])
     with col1:
         symbol_query = st.text_input(
@@ -607,51 +711,6 @@ def main() -> None:
             options=list(TIMEFRAMES.keys()),
             default=["1h", "4h", "1d", "1w"],
         )
-    divergence_types = st.multiselect(
-        "Divergence types",
-        options=["regular_bullish", "regular_bearish", "hidden_bullish", "hidden_bearish"],
-        default=list(DEFAULT_ENABLED_DIVERGENCE_TYPES),
-        format_func=_humanize_text,
-    )
-    selected_indicators = st.multiselect(
-        "Indicators",
-        options=["rsi", "macd_hist"],
-        default=list(DEFAULT_ENABLED_INDICATORS),
-        format_func=_humanize_text,
-    )
-    use_ma_regime_filter = st.checkbox("Use MA regime filter (daily/weekly)", value=USE_MA_REGIME_FILTER)
-    ma_regime_filter_mode = st.selectbox(
-        "MA regime mode",
-        options=["soft", "hard"],
-        index=0 if MA_REGIME_FILTER_MODE == "soft" else 1,
-        help="Soft: reject only direct regime opposition. Hard: require exact regime alignment.",
-    )
-    strict_indicator_pivots = st.checkbox(
-        "Strict indicator pivots (require indicator swing pivots)",
-        value=USE_STRICT_INDICATOR_PIVOTS,
-    )
-    if st.button("Clear price cache"):
-        _load_price_cached.clear()
-        st.success("Price cache cleared. Run Scan again to reload full history.")
-    if st.button("Clear scanner cache"):
-        if hasattr(screener_scanner, "clear_candle_cache"):
-            screener_scanner.clear_candle_cache()
-        st.success("Scanner candle cache cleared. Run Scan again to reload fresh candles.")
-    backtest_enabled = st.checkbox("Show historical backtest", value=True)
-    backtest_horizon = st.number_input(
-        "Backtest horizon (bars)",
-        min_value=1,
-        max_value=50,
-        value=10,
-        step=1,
-    )
-    chart_max_bars = st.number_input(
-        "Chart bars to display",
-        min_value=200,
-        max_value=5000,
-        value=800,
-        step=100,
-    )
 
     if "scan_ready" not in st.session_state:
         st.session_state.scan_ready = False
@@ -661,7 +720,7 @@ def main() -> None:
         st.session_state.scan_backtest_enabled = True
         st.session_state.scan_backtest_horizon = 10
 
-    run_scan = st.button("Run Scan", type="primary")
+    run_scan = st.button("Run Scan", type="primary", use_container_width=True)
 
     if run_scan:
         symbol = st.session_state.symbol_input.strip().upper()
@@ -673,18 +732,29 @@ def main() -> None:
             st.warning("Please select at least one timeframe.")
             return
 
-        with st.spinner("Scanning symbols..."):
-            results = scan_universe(
-                symbols,
-                selected_tfs,
-                divergence_types=divergence_types,
-                indicators=selected_indicators,
-                use_ma_regime_filter=use_ma_regime_filter,
-                ma_regime_filter_mode=ma_regime_filter_mode,
-                strict_indicator_pivots=strict_indicator_pivots,
+        with st.spinner(f"Looking up {symbol}..."):
+            try:
+                symbol_has_data = any(not load_price(symbol, tf).empty for tf in selected_tfs)
+            except Exception:
+                st.session_state.scan_ready = False
+                st.error(
+                    f"Couldn't reach the market data provider while looking up '{symbol}'. "
+                    "This is usually a temporary network issue — please try again in a moment."
+                )
+                return
+
+        if not symbol_has_data:
+            st.session_state.scan_ready = False
+            st.error(
+                f"No market data found for '{symbol}'. Double-check the ticker spelling, or type "
+                "a company name and pick a match from the Suggestions dropdown above. If the symbol "
+                "looks right, the data provider may be temporarily unavailable — try again shortly."
             )
-            history_results = (
-                scan_universe_history(
+            return
+
+        with st.spinner("Scanning symbols..."):
+            try:
+                results = scan_universe(
                     symbols,
                     selected_tfs,
                     divergence_types=divergence_types,
@@ -693,9 +763,28 @@ def main() -> None:
                     ma_regime_filter_mode=ma_regime_filter_mode,
                     strict_indicator_pivots=strict_indicator_pivots,
                 )
-                if backtest_enabled
-                else pd.DataFrame()
-            )
+                history_results = (
+                    scan_universe_history(
+                        symbols,
+                        selected_tfs,
+                        divergence_types=divergence_types,
+                        indicators=selected_indicators,
+                        use_ma_regime_filter=use_ma_regime_filter,
+                        ma_regime_filter_mode=ma_regime_filter_mode,
+                        strict_indicator_pivots=strict_indicator_pivots,
+                    )
+                    if backtest_enabled
+                    else pd.DataFrame()
+                )
+            except Exception as exc:
+                st.session_state.scan_ready = False
+                st.error(
+                    "Something went wrong while scanning. Try again, or clear the caches in the "
+                    "sidebar (Cache Management) if the problem persists."
+                )
+                with st.expander("Technical details"):
+                    st.code(str(exc))
+                return
 
         coverage = pd.DataFrame({"symbol": symbols})
         coverage["signal_count"] = coverage["symbol"].map(results["symbol"].value_counts()).fillna(0).astype(int)
@@ -724,7 +813,15 @@ def main() -> None:
         if results.empty:
             st.info("No divergences found with current settings.")
         else:
-            st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(results))), width="stretch")
+            st.caption("Sorted by score — strongest setups first.")
+            pretty_results = _pretty_dataframe(_format_pct_values(_format_currency_values(results)))
+            st.dataframe(_style_score_column(pretty_results), width="stretch")
+            st.download_button(
+                "Download signals as CSV",
+                data=pretty_results.to_csv(index=False).encode("utf-8"),
+                file_name=f"{results['symbol'].iloc[0]}_signals.csv",
+                mime="text/csv",
+            )
 
             st.subheader("Chart Preview")
             hide_non_trading_gaps = st.checkbox(
@@ -774,10 +871,13 @@ def main() -> None:
             st.dataframe(_format_pct_values(_format_currency_values(diagnostics)), width="stretch")
             st.caption("Score component breakdown")
             score_components = row.get("score_components", {})
-            pretty_components = {
-                _humanize_text(k): v for k, v in (score_components.items() if isinstance(score_components, dict) else [])
-            }
-            st.json(pretty_components, expanded=False)
+            if isinstance(score_components, dict) and score_components:
+                components_df = pd.DataFrame(
+                    [{"component": _humanize_text(k), "points": v} for k, v in score_components.items()]
+                ).sort_values("points", ascending=False).reset_index(drop=True)
+                st.dataframe(components_df, width="stretch", hide_index=True)
+            else:
+                st.caption("No score component breakdown available.")
             st.caption(
                 "Score is a ranking strength metric. Higher score means stronger multi-factor confirmation, "
                 "not guaranteed profit. It combines timeframe weight, indicator confirmation, recent price impulse, "
@@ -826,14 +926,20 @@ def main() -> None:
                         "from entry over the backtest horizon. Strategy return applies signal direction: long "
                         "keeps sign, short flips sign."
                     )
-                    st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(backtest_df))), width="stretch")
-                    st.caption("Divergence type guide")
-                    st.markdown(
-                        "- regular bullish: price makes a lower low while the indicator makes a higher low (possible upside reversal).\n"
-                        "- regular bearish: price makes a higher high while the indicator makes a lower high (possible downside reversal).\n"
-                        "- hidden bullish: price makes a higher low while the indicator makes a lower low (bullish continuation bias).\n"
-                        "- hidden bearish: price makes a lower high while the indicator makes a higher high (bearish continuation bias)."
+                    pretty_backtest = _pretty_dataframe(_format_pct_values(_format_currency_values(backtest_df)))
+                    st.dataframe(pretty_backtest, width="stretch")
+                    st.download_button(
+                        "Download backtest as CSV",
+                        data=pretty_backtest.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{backtest_df['symbol'].iloc[0]}_backtest.csv",
+                        mime="text/csv",
                     )
+    else:
+        st.info(
+            "Enter a symbol above, pick your timeframes, and click **Run Scan** to see divergence "
+            "signals, chart overlays, and a historical backtest here. (Divergence type explanations "
+            "are in the sidebar under **Divergence & Indicators**.)"
+        )
 
 
 if __name__ == "__main__":
