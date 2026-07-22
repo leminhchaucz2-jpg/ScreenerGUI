@@ -205,6 +205,25 @@ def _format_currency_values(frame: pd.DataFrame) -> pd.DataFrame:
     return formatted
 
 
+def _style_score_column(frame: pd.DataFrame, score_col: str = "score"):
+    if frame.empty or score_col not in frame.columns:
+        return frame
+
+    scores = pd.to_numeric(frame[score_col], errors="coerce")
+    min_score, max_score = scores.min(), scores.max()
+    span = max(max_score - min_score, 1e-9)
+
+    def _color(value: object) -> str:
+        score = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.isna(score):
+            return ""
+        intensity = (score - min_score) / span
+        alpha = 0.15 + 0.55 * intensity
+        return f"background-color: rgba(46, 163, 96, {alpha:.2f})"
+
+    return frame.style.map(_color, subset=[score_col])
+
+
 def _build_market_rangebreaks(candles: pd.DataFrame, timeframe: str, *, hide_non_trading_gaps: bool) -> list[dict[str, object]]:
     if not hide_non_trading_gaps:
         return []
@@ -578,21 +597,45 @@ def main() -> None:
         st.header("Scan Settings")
 
         with st.expander("Divergence & Indicators", expanded=True):
+            st.caption(
+                "Divergence is when price and an indicator move in different directions — "
+                "often an early sign of a reversal or continuation."
+            )
             divergence_types = st.multiselect(
                 "Divergence types",
                 options=["regular_bullish", "regular_bearish", "hidden_bullish", "hidden_bearish"],
                 default=list(DEFAULT_ENABLED_DIVERGENCE_TYPES),
                 format_func=_humanize_text,
+                help="Which divergence patterns to scan for. See the guide below for what each means.",
             )
             selected_indicators = st.multiselect(
                 "Indicators",
                 options=["rsi", "macd_hist"],
                 default=list(DEFAULT_ENABLED_INDICATORS),
                 format_func=_humanize_text,
+                help="Which indicator(s) to compare against price when looking for divergence.",
+            )
+            st.markdown(
+                "- **Regular bullish**: price makes a lower low while the indicator makes a "
+                "higher low (possible upside reversal).\n"
+                "- **Regular bearish**: price makes a higher high while the indicator makes a "
+                "lower high (possible downside reversal).\n"
+                "- **Hidden bullish**: price makes a higher low while the indicator makes a "
+                "lower low (bullish continuation bias).\n"
+                "- **Hidden bearish**: price makes a lower high while the indicator makes a "
+                "higher high (bearish continuation bias)."
             )
 
         with st.expander("MA Regime Filter"):
-            use_ma_regime_filter = st.checkbox("Use MA regime filter (daily/weekly)", value=USE_MA_REGIME_FILTER)
+            use_ma_regime_filter = st.checkbox(
+                "Use MA regime filter (daily/weekly)",
+                value=USE_MA_REGIME_FILTER,
+                help=(
+                    "Only keep signals that agree with the broader trend (50/200 moving "
+                    "averages on daily and weekly candles). Reduces reversal signals taken "
+                    "against a strong prevailing trend."
+                ),
+            )
             ma_regime_filter_mode = st.selectbox(
                 "MA regime mode",
                 options=["soft", "hard"],
@@ -604,6 +647,11 @@ def main() -> None:
             strict_indicator_pivots = st.checkbox(
                 "Strict indicator pivots (require indicator swing pivots)",
                 value=USE_STRICT_INDICATOR_PIVOTS,
+                help=(
+                    "When on, the indicator (RSI or MACD histogram) must form its own "
+                    "independent swing high/low at the same point as the price pivot. Filters "
+                    "out weaker setups, but finds fewer signals overall."
+                ),
             )
 
         with st.expander("Backtest"):
@@ -769,7 +817,9 @@ def main() -> None:
         if results.empty:
             st.info("No divergences found with current settings.")
         else:
-            st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(results))), width="stretch")
+            st.caption("Sorted by score — strongest setups first.")
+            pretty_results = _pretty_dataframe(_format_pct_values(_format_currency_values(results)))
+            st.dataframe(_style_score_column(pretty_results), width="stretch")
 
             st.subheader("Chart Preview")
             hide_non_trading_gaps = st.checkbox(
@@ -819,10 +869,13 @@ def main() -> None:
             st.dataframe(_format_pct_values(_format_currency_values(diagnostics)), width="stretch")
             st.caption("Score component breakdown")
             score_components = row.get("score_components", {})
-            pretty_components = {
-                _humanize_text(k): v for k, v in (score_components.items() if isinstance(score_components, dict) else [])
-            }
-            st.json(pretty_components, expanded=False)
+            if isinstance(score_components, dict) and score_components:
+                components_df = pd.DataFrame(
+                    [{"component": _humanize_text(k), "points": v} for k, v in score_components.items()]
+                ).sort_values("points", ascending=False).reset_index(drop=True)
+                st.dataframe(components_df, width="stretch", hide_index=True)
+            else:
+                st.caption("No score component breakdown available.")
             st.caption(
                 "Score is a ranking strength metric. Higher score means stronger multi-factor confirmation, "
                 "not guaranteed profit. It combines timeframe weight, indicator confirmation, recent price impulse, "
@@ -872,13 +925,12 @@ def main() -> None:
                         "keeps sign, short flips sign."
                     )
                     st.dataframe(_pretty_dataframe(_format_pct_values(_format_currency_values(backtest_df))), width="stretch")
-                    st.caption("Divergence type guide")
-                    st.markdown(
-                        "- regular bullish: price makes a lower low while the indicator makes a higher low (possible upside reversal).\n"
-                        "- regular bearish: price makes a higher high while the indicator makes a lower high (possible downside reversal).\n"
-                        "- hidden bullish: price makes a higher low while the indicator makes a lower low (bullish continuation bias).\n"
-                        "- hidden bearish: price makes a lower high while the indicator makes a higher high (bearish continuation bias)."
-                    )
+    else:
+        st.info(
+            "Enter a symbol above, pick your timeframes, and click **Run Scan** to see divergence "
+            "signals, chart overlays, and a historical backtest here. (Divergence type explanations "
+            "are in the sidebar under **Divergence & Indicators**.)"
+        )
 
 
 if __name__ == "__main__":
