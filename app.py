@@ -574,6 +574,66 @@ def main() -> None:
     if "symbol_input" not in st.session_state:
         st.session_state.symbol_input = "AAPL"
 
+    with st.sidebar:
+        st.header("Scan Settings")
+
+        with st.expander("Divergence & Indicators", expanded=True):
+            divergence_types = st.multiselect(
+                "Divergence types",
+                options=["regular_bullish", "regular_bearish", "hidden_bullish", "hidden_bearish"],
+                default=list(DEFAULT_ENABLED_DIVERGENCE_TYPES),
+                format_func=_humanize_text,
+            )
+            selected_indicators = st.multiselect(
+                "Indicators",
+                options=["rsi", "macd_hist"],
+                default=list(DEFAULT_ENABLED_INDICATORS),
+                format_func=_humanize_text,
+            )
+
+        with st.expander("MA Regime Filter"):
+            use_ma_regime_filter = st.checkbox("Use MA regime filter (daily/weekly)", value=USE_MA_REGIME_FILTER)
+            ma_regime_filter_mode = st.selectbox(
+                "MA regime mode",
+                options=["soft", "hard"],
+                index=0 if MA_REGIME_FILTER_MODE == "soft" else 1,
+                help="Soft: reject only direct regime opposition. Hard: require exact regime alignment.",
+            )
+
+        with st.expander("Signal Precision"):
+            strict_indicator_pivots = st.checkbox(
+                "Strict indicator pivots (require indicator swing pivots)",
+                value=USE_STRICT_INDICATOR_PIVOTS,
+            )
+
+        with st.expander("Backtest"):
+            backtest_enabled = st.checkbox("Show historical backtest", value=True)
+            backtest_horizon = st.number_input(
+                "Backtest horizon (bars)",
+                min_value=1,
+                max_value=50,
+                value=10,
+                step=1,
+            )
+
+        with st.expander("Chart Display"):
+            chart_max_bars = st.number_input(
+                "Chart bars to display",
+                min_value=200,
+                max_value=5000,
+                value=800,
+                step=100,
+            )
+
+        with st.expander("Cache Management"):
+            if st.button("Clear price cache"):
+                _load_price_cached.clear()
+                st.success("Price cache cleared. Run Scan again to reload full history.")
+            if st.button("Clear scanner cache"):
+                if hasattr(screener_scanner, "clear_candle_cache"):
+                    screener_scanner.clear_candle_cache()
+                st.success("Scanner candle cache cleared. Run Scan again to reload fresh candles.")
+
     col1, col2 = st.columns([2, 1])
     with col1:
         symbol_query = st.text_input(
@@ -607,51 +667,6 @@ def main() -> None:
             options=list(TIMEFRAMES.keys()),
             default=["1h", "4h", "1d", "1w"],
         )
-    divergence_types = st.multiselect(
-        "Divergence types",
-        options=["regular_bullish", "regular_bearish", "hidden_bullish", "hidden_bearish"],
-        default=list(DEFAULT_ENABLED_DIVERGENCE_TYPES),
-        format_func=_humanize_text,
-    )
-    selected_indicators = st.multiselect(
-        "Indicators",
-        options=["rsi", "macd_hist"],
-        default=list(DEFAULT_ENABLED_INDICATORS),
-        format_func=_humanize_text,
-    )
-    use_ma_regime_filter = st.checkbox("Use MA regime filter (daily/weekly)", value=USE_MA_REGIME_FILTER)
-    ma_regime_filter_mode = st.selectbox(
-        "MA regime mode",
-        options=["soft", "hard"],
-        index=0 if MA_REGIME_FILTER_MODE == "soft" else 1,
-        help="Soft: reject only direct regime opposition. Hard: require exact regime alignment.",
-    )
-    strict_indicator_pivots = st.checkbox(
-        "Strict indicator pivots (require indicator swing pivots)",
-        value=USE_STRICT_INDICATOR_PIVOTS,
-    )
-    if st.button("Clear price cache"):
-        _load_price_cached.clear()
-        st.success("Price cache cleared. Run Scan again to reload full history.")
-    if st.button("Clear scanner cache"):
-        if hasattr(screener_scanner, "clear_candle_cache"):
-            screener_scanner.clear_candle_cache()
-        st.success("Scanner candle cache cleared. Run Scan again to reload fresh candles.")
-    backtest_enabled = st.checkbox("Show historical backtest", value=True)
-    backtest_horizon = st.number_input(
-        "Backtest horizon (bars)",
-        min_value=1,
-        max_value=50,
-        value=10,
-        step=1,
-    )
-    chart_max_bars = st.number_input(
-        "Chart bars to display",
-        min_value=200,
-        max_value=5000,
-        value=800,
-        step=100,
-    )
 
     if "scan_ready" not in st.session_state:
         st.session_state.scan_ready = False
@@ -661,7 +676,7 @@ def main() -> None:
         st.session_state.scan_backtest_enabled = True
         st.session_state.scan_backtest_horizon = 10
 
-    run_scan = st.button("Run Scan", type="primary")
+    run_scan = st.button("Run Scan", type="primary", use_container_width=True)
 
     if run_scan:
         symbol = st.session_state.symbol_input.strip().upper()
