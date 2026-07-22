@@ -688,18 +688,29 @@ def main() -> None:
             st.warning("Please select at least one timeframe.")
             return
 
-        with st.spinner("Scanning symbols..."):
-            results = scan_universe(
-                symbols,
-                selected_tfs,
-                divergence_types=divergence_types,
-                indicators=selected_indicators,
-                use_ma_regime_filter=use_ma_regime_filter,
-                ma_regime_filter_mode=ma_regime_filter_mode,
-                strict_indicator_pivots=strict_indicator_pivots,
+        with st.spinner(f"Looking up {symbol}..."):
+            try:
+                symbol_has_data = any(not load_price(symbol, tf).empty for tf in selected_tfs)
+            except Exception:
+                st.session_state.scan_ready = False
+                st.error(
+                    f"Couldn't reach the market data provider while looking up '{symbol}'. "
+                    "This is usually a temporary network issue — please try again in a moment."
+                )
+                return
+
+        if not symbol_has_data:
+            st.session_state.scan_ready = False
+            st.error(
+                f"No market data found for '{symbol}'. Double-check the ticker spelling, or type "
+                "a company name and pick a match from the Suggestions dropdown above. If the symbol "
+                "looks right, the data provider may be temporarily unavailable — try again shortly."
             )
-            history_results = (
-                scan_universe_history(
+            return
+
+        with st.spinner("Scanning symbols..."):
+            try:
+                results = scan_universe(
                     symbols,
                     selected_tfs,
                     divergence_types=divergence_types,
@@ -708,9 +719,28 @@ def main() -> None:
                     ma_regime_filter_mode=ma_regime_filter_mode,
                     strict_indicator_pivots=strict_indicator_pivots,
                 )
-                if backtest_enabled
-                else pd.DataFrame()
-            )
+                history_results = (
+                    scan_universe_history(
+                        symbols,
+                        selected_tfs,
+                        divergence_types=divergence_types,
+                        indicators=selected_indicators,
+                        use_ma_regime_filter=use_ma_regime_filter,
+                        ma_regime_filter_mode=ma_regime_filter_mode,
+                        strict_indicator_pivots=strict_indicator_pivots,
+                    )
+                    if backtest_enabled
+                    else pd.DataFrame()
+                )
+            except Exception as exc:
+                st.session_state.scan_ready = False
+                st.error(
+                    "Something went wrong while scanning. Try again, or clear the caches in the "
+                    "sidebar (Cache Management) if the problem persists."
+                )
+                with st.expander("Technical details"):
+                    st.code(str(exc))
+                return
 
         coverage = pd.DataFrame({"symbol": symbols})
         coverage["signal_count"] = coverage["symbol"].map(results["symbol"].value_counts()).fillna(0).astype(int)
