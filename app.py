@@ -36,11 +36,24 @@ from screener.data import fetch_candles, resample_ohlcv
 import screener.indicators as screener_indicators
 import screener.scanner as screener_scanner
 from screener.strategies import (
+    add_atr_column,
+    backtest_bollinger_breakout,
+    backtest_cci_extreme_reversal,
+    backtest_di_crossover,
+    backtest_golden_cross_trend,
     backtest_macd_zero_cross,
     backtest_rsi_mtf,
+    backtest_stoch_rsi_swing,
+    backtest_volume_confirmed_breakout,
+    bollinger_breakout_signal_frame,
+    cci_extreme_reversal_signal_frame,
+    di_crossover_signal_frame,
+    golden_cross_trend_signal_frame,
     macd_zero_cross_signal_frame,
     rsi_mtf_signal_frame,
+    stoch_rsi_swing_signal_frame,
     summarize_trades,
+    volume_confirmed_breakout_signal_frame,
 )
 
 scan_universe = screener_scanner.scan_universe
@@ -55,6 +68,83 @@ compute_sma = getattr(
     "compute_sma",
     lambda close, period: close.rolling(window=period, min_periods=period).mean(),
 )
+
+# Single-timeframe strategies for the Strategy Lab: each needs only one symbol +
+# one timeframe of candles, unlike RSI Multi-Timeframe Alignment which pulls in
+# an extra higher-timeframe series and gets its own UI branch below.
+SINGLE_TIMEFRAME_STRATEGIES: dict[str, dict[str, object]] = {
+    "macd_zero_cross": {
+        "label": "MACD Zero-Cross",
+        "caption": (
+            "Entry: MACD line above 0. Exit: MACD histogram turns negative "
+            "(the same moment the MACD line crosses back below its signal line)."
+        ),
+        "default_timeframe": "1d",
+        "signal_frame_fn": macd_zero_cross_signal_frame,
+        "backtest_fn": backtest_macd_zero_cross,
+    },
+    "bollinger_breakout": {
+        "label": "Bollinger Breakout",
+        "caption": (
+            "Entry: close breaks above the upper Bollinger band (%B > 1.0) - a "
+            "momentum breakout read. Exit: %B fades back below 0.5."
+        ),
+        "default_timeframe": "1d",
+        "signal_frame_fn": bollinger_breakout_signal_frame,
+        "backtest_fn": backtest_bollinger_breakout,
+    },
+    "golden_cross_trend": {
+        "label": "Golden Cross + Trend Strength",
+        "caption": (
+            "Entry: SMA50 crosses above SMA200 while ADX confirms an actual trend. "
+            "Exit: SMA50 crosses back below SMA200, or ADX fades below 20 even "
+            "without a cross."
+        ),
+        "default_timeframe": "1d",
+        "signal_frame_fn": golden_cross_trend_signal_frame,
+        "backtest_fn": backtest_golden_cross_trend,
+    },
+    "stoch_rsi_swing": {
+        "label": "Stochastic RSI Swing",
+        "caption": (
+            "Entry: %K crosses above %D while both are below 20. Exit: %K crosses "
+            "back below %D while both are above 80."
+        ),
+        "default_timeframe": "4h",
+        "signal_frame_fn": stoch_rsi_swing_signal_frame,
+        "backtest_fn": backtest_stoch_rsi_swing,
+    },
+    "cci_extreme_reversal": {
+        "label": "CCI Extreme Reversal",
+        "caption": (
+            "Entry: CCI crosses back above -100 from below. Exit: CCI crosses "
+            "back below +100 from above."
+        ),
+        "default_timeframe": "1d",
+        "signal_frame_fn": cci_extreme_reversal_signal_frame,
+        "backtest_fn": backtest_cci_extreme_reversal,
+    },
+    "di_crossover": {
+        "label": "DI Crossover",
+        "caption": (
+            "Entry: +DI crosses above -DI while ADX confirms a trend forming. "
+            "Exit: -DI crosses back above +DI."
+        ),
+        "default_timeframe": "1d",
+        "signal_frame_fn": di_crossover_signal_frame,
+        "backtest_fn": backtest_di_crossover,
+    },
+    "volume_confirmed_breakout": {
+        "label": "Volume-Confirmed Breakout",
+        "caption": (
+            "Entry: close makes a new 20-bar high and OBV also makes a new 20-bar "
+            "high. Exit: OBV rolls over below its own 20-period moving average."
+        ),
+        "default_timeframe": "1d",
+        "signal_frame_fn": volume_confirmed_breakout_signal_frame,
+        "backtest_fn": backtest_volume_confirmed_breakout,
+    },
+}
 
 
 @st.cache_data(ttl=1800)
@@ -796,26 +886,27 @@ def main() -> None:
                 "scan above. Long only: buy when the entry rule turns on, sell when the "
                 "exit rule turns on."
             )
+            strategy_options = list(SINGLE_TIMEFRAME_STRATEGIES.keys()) + ["rsi_mtf_alignment"]
+            strategy_labels = {
+                key: conf["label"] for key, conf in SINGLE_TIMEFRAME_STRATEGIES.items()
+            }
+            strategy_labels["rsi_mtf_alignment"] = "RSI Multi-Timeframe Alignment"
             strategy_choice = st.selectbox(
                 "Strategy",
-                options=["macd_zero_cross", "rsi_mtf_alignment"],
-                format_func=lambda s: {
-                    "macd_zero_cross": "MACD Zero-Cross",
-                    "rsi_mtf_alignment": "RSI Multi-Timeframe Alignment",
-                }[s],
+                options=strategy_options,
+                format_func=lambda s: strategy_labels[s],
             )
 
             timeframe_options = list(TIMEFRAMES.keys())
-            if strategy_choice == "macd_zero_cross":
-                st.caption(
-                    "Entry: MACD line above 0. Exit: MACD histogram turns negative "
-                    "(the same moment the MACD line crosses back below its signal line)."
-                )
-                macd_strategy_timeframe = st.selectbox(
+            if strategy_choice in SINGLE_TIMEFRAME_STRATEGIES:
+                strategy_conf = SINGLE_TIMEFRAME_STRATEGIES[strategy_choice]
+                st.caption(strategy_conf["caption"])
+                default_tf = strategy_conf["default_timeframe"]
+                single_tf_strategy_timeframe = st.selectbox(
                     "Timeframe",
                     options=timeframe_options,
-                    index=timeframe_options.index("1d") if "1d" in timeframe_options else 0,
-                    key="macd_strategy_timeframe",
+                    index=timeframe_options.index(default_tf) if default_tf in timeframe_options else 0,
+                    key="single_tf_strategy_timeframe",
                 )
             else:
                 st.caption(
@@ -846,6 +937,24 @@ def main() -> None:
                 exec_exit_thresh = st.number_input(
                     "Execution TF exit threshold", min_value=50.0, max_value=95.0, value=70.0, step=1.0
                 )
+
+            st.caption(
+                "Optional: bolt an ATR trailing stop onto whichever strategy is selected "
+                "above - exits (one bar later) the first time price closes below the "
+                "highest close reached since entry, minus a multiple of ATR."
+            )
+            use_atr_trailing_stop = st.checkbox("Add ATR trailing-stop exit", value=False)
+            atr_trailing_stop_multiplier = (
+                st.number_input(
+                    "ATR trailing-stop multiplier",
+                    min_value=0.5,
+                    max_value=10.0,
+                    value=3.0,
+                    step=0.5,
+                )
+                if use_atr_trailing_stop
+                else None
+            )
 
         with st.expander("Cache Management"):
             if st.button("Clear price cache"):
@@ -1144,15 +1253,20 @@ def main() -> None:
             st.warning("Please provide a symbol.")
         else:
             try:
-                if strategy_choice == "macd_zero_cross":
-                    candles = load_price(symbol, macd_strategy_timeframe)
+                if strategy_choice in SINGLE_TIMEFRAME_STRATEGIES:
+                    strategy_conf = SINGLE_TIMEFRAME_STRATEGIES[strategy_choice]
+                    candles = load_price(symbol, single_tf_strategy_timeframe)
                     if candles.empty:
-                        st.error(f"No market data found for '{symbol}' on {macd_strategy_timeframe}.")
+                        st.error(f"No market data found for '{symbol}' on {single_tf_strategy_timeframe}.")
                     else:
-                        signal_frame = macd_zero_cross_signal_frame(candles)
-                        trades = backtest_macd_zero_cross(symbol, signal_frame)
+                        signal_frame = strategy_conf["signal_frame_fn"](candles)
+                        if atr_trailing_stop_multiplier is not None:
+                            signal_frame = add_atr_column(candles, signal_frame)
+                        trades = strategy_conf["backtest_fn"](
+                            symbol, signal_frame, atr_trailing_stop_multiplier=atr_trailing_stop_multiplier
+                        )
                         st.session_state.strategy_backtest_trades = trades
-                        st.session_state.strategy_backtest_name = "MACD Zero-Cross"
+                        st.session_state.strategy_backtest_name = strategy_conf["label"]
                         st.session_state.strategy_backtest_ready = True
                 elif not higher_timeframes:
                     st.warning("Pick at least one higher timeframe for the RSI multi-timeframe strategy.")
@@ -1163,12 +1277,15 @@ def main() -> None:
                         st.error(f"No market data found for '{symbol}' on one of the selected timeframes.")
                     else:
                         signal_frame = rsi_mtf_signal_frame(exec_candles, higher_candles_by_tf)
+                        if atr_trailing_stop_multiplier is not None:
+                            signal_frame = add_atr_column(exec_candles, signal_frame)
                         trades = backtest_rsi_mtf(
                             symbol,
                             signal_frame,
                             higher_entry_thresh=higher_entry_thresh,
                             exec_entry_thresh=exec_entry_thresh,
                             exec_exit_thresh=exec_exit_thresh,
+                            atr_trailing_stop_multiplier=atr_trailing_stop_multiplier,
                         )
                         st.session_state.strategy_backtest_trades = trades
                         st.session_state.strategy_backtest_name = "RSI Multi-Timeframe Alignment"

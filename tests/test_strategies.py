@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+import src.screener.strategies as strategies
 from src.screener.strategies import (
     backtest_macd_zero_cross,
     backtest_rsi_mtf,
@@ -124,6 +125,153 @@ def test_backtest_rsi_mtf_requires_arming_before_exit() -> None:
     # 6 -> exit fills one bar later, at bar 7's close.
     assert row["exit_time"] == index[7]
     assert row["exit_reason"] == "rsi_faded_below_exit_thresh"
+
+
+def test_bollinger_breakout_signal_frame_crossing_logic(monkeypatch) -> None:
+    index = pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC")
+    candles = _candles(index, [10.0] * 5)
+    bb_df = pd.DataFrame(
+        {
+            "bb_mid": [0.0] * 5,
+            "bb_upper": [0.0] * 5,
+            "bb_lower": [0.0] * 5,
+            "bb_percent_b": [0.3, 1.1, 0.6, 0.4, 1.2],
+        },
+        index=index,
+    )
+    monkeypatch.setattr(strategies, "compute_bollinger_bands", lambda *a, **k: bb_df)
+
+    frame = strategies.bollinger_breakout_signal_frame(candles)
+
+    assert list(frame["entry_signal"]) == [False, True, False, False, True]
+    assert list(frame["exit_signal"]) == [True, False, False, True, False]
+
+
+def test_golden_cross_trend_signal_frame_requires_adx_confirmation(monkeypatch) -> None:
+    index = pd.date_range("2024-01-01", periods=8, freq="D", tz="UTC")
+    candles = _candles(index, [10.0] * 8)
+
+    fast_vals = pd.Series([1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0], index=index)
+    slow_vals = pd.Series([2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0], index=index)
+
+    def fake_sma(close, period):
+        return fast_vals if period == 50 else slow_vals
+
+    adx_df = pd.DataFrame(
+        {
+            "adx": [30.0, 30.0, 10.0, 30.0, 30.0, 30.0, 30.0, 30.0],
+            "plus_di": [0.0] * 8,
+            "minus_di": [0.0] * 8,
+        },
+        index=index,
+    )
+
+    monkeypatch.setattr(strategies, "compute_sma", fake_sma)
+    monkeypatch.setattr(strategies, "compute_adx", lambda *a, **k: adx_df)
+
+    frame = strategies.golden_cross_trend_signal_frame(candles)
+
+    # First golden cross (bar 2) is gated out by weak ADX (10); the second (bar 6)
+    # goes through since ADX confirms a real trend there.
+    assert list(frame["entry_signal"]) == [False, False, False, False, False, False, True, False]
+    # Death cross at bar 4 exits; ADX dipping below 20 at bar 2 also forces an exit
+    # there even without a cross, since the trend has already gone weak.
+    assert list(frame["exit_signal"]) == [False, False, True, False, True, False, False, False]
+
+
+def test_stoch_rsi_swing_signal_frame_crossing_logic(monkeypatch) -> None:
+    index = pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC")
+    candles = _candles(index, [10.0] * 6)
+    stoch_df = pd.DataFrame(
+        {
+            "stoch_rsi_k": [25.0, 10.0, 15.0, 30.0, 90.0, 65.0],
+            "stoch_rsi_d": [20.0, 18.0, 12.0, 25.0, 95.0, 85.0],
+        },
+        index=index,
+    )
+    monkeypatch.setattr(strategies, "compute_stoch_rsi", lambda *a, **k: stoch_df)
+
+    frame = strategies.stoch_rsi_swing_signal_frame(candles)
+
+    assert list(frame["entry_signal"]) == [False, False, True, False, False, False]
+    assert list(frame["exit_signal"]) == [False, False, False, False, True, False]
+
+
+def test_cci_extreme_reversal_signal_frame_crossing_logic(monkeypatch) -> None:
+    index = pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC")
+    candles = _candles(index, [10.0] * 6)
+    cci_values = pd.Series([-150.0, -120.0, -80.0, 50.0, 130.0, 90.0], index=index)
+    monkeypatch.setattr(strategies, "compute_cci", lambda high, low, close, period=14: cci_values)
+
+    frame = strategies.cci_extreme_reversal_signal_frame(candles)
+
+    assert list(frame["entry_signal"]) == [False, False, True, False, False, False]
+    assert list(frame["exit_signal"]) == [False, False, False, False, False, True]
+
+
+def test_di_crossover_signal_frame_crossing_logic_and_adx_gating(monkeypatch) -> None:
+    index = pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC")
+    candles = _candles(index, [10.0] * 6)
+    adx_df = pd.DataFrame(
+        {
+            "adx": [30.0, 30.0, 30.0, 30.0, 5.0, 30.0],
+            "plus_di": [10.0, 15.0, 25.0, 20.0, 25.0, 10.0],
+            "minus_di": [20.0, 18.0, 15.0, 30.0, 20.0, 25.0],
+        },
+        index=index,
+    )
+    monkeypatch.setattr(strategies, "compute_adx", lambda *a, **k: adx_df)
+
+    frame = strategies.di_crossover_signal_frame(candles)
+
+    # +DI crosses above -DI at bar 2 (ADX confirms) and again at bar 4 (ADX too weak
+    # there to confirm, so that one is gated out).
+    assert list(frame["entry_signal"]) == [False, False, True, False, False, False]
+    # -DI crosses back above +DI at bars 3 and 5 - no ADX gate on the exit side.
+    assert list(frame["exit_signal"]) == [False, False, False, True, False, True]
+
+
+def test_volume_confirmed_breakout_signal_frame(monkeypatch) -> None:
+    index = pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC")
+    candles = _candles(index, [10.0, 12.0, 11.0, 13.0, 9.0, 14.0])
+
+    obv_vals = pd.Series([100.0, 200.0, 150.0, 250.0, 50.0, 300.0], index=index)
+    obv_sma_vals = pd.Series([90.0, 90.0, 90.0, 90.0, 200.0, 90.0], index=index)
+
+    monkeypatch.setattr(strategies, "compute_obv", lambda close, volume: obv_vals)
+    monkeypatch.setattr(strategies, "compute_sma", lambda series, period: obv_sma_vals)
+
+    frame = strategies.volume_confirmed_breakout_signal_frame(candles, lookback_bars=3)
+
+    assert list(frame["entry_signal"]) == [False, False, False, True, False, True]
+    assert list(frame["exit_signal"]) == [False, False, False, False, True, False]
+
+
+def test_atr_trailing_stop_exits_before_a_rule_signal_that_never_fires() -> None:
+    index = pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "close": [10.0, 12.0, 20.0, 14.0, 14.0, 14.0],
+            "atr": [1.0] * 6,
+            "entry_signal": [False, True, False, False, False, False],
+            "exit_signal": [False, False, False, False, False, False],
+        },
+        index=index,
+    )
+
+    without_stop = backtest_macd_zero_cross("TEST", frame)
+    assert without_stop.empty  # the rule exit never fires, so nothing closes it out
+
+    with_stop = backtest_macd_zero_cross("TEST", frame, atr_trailing_stop_multiplier=2.0)
+    assert len(with_stop) == 1
+    row = with_stop.iloc[0]
+    # Runs up to a high of 20 (bar 2), then gives back more than 2*ATR (2.0) from
+    # that high at bar 3 (20 - 2 = 18, close of 14 is well below) -> stop confirmed
+    # at bar 3, fills at bar 4's close.
+    assert row["entry_price"] == pytest.approx(20.0)
+    assert row["exit_time"] == index[4]
+    assert row["exit_price"] == pytest.approx(14.0)
+    assert row["exit_reason"] == "atr_trailing_stop"
 
 
 def test_summarize_trades_handles_empty_and_populated() -> None:
