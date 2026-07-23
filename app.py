@@ -35,6 +35,13 @@ from screener.config import (
 from screener.data import fetch_candles, resample_ohlcv
 import screener.indicators as screener_indicators
 import screener.scanner as screener_scanner
+from screener.strategies import (
+    backtest_macd_zero_cross,
+    backtest_rsi_mtf,
+    macd_zero_cross_signal_frame,
+    rsi_mtf_signal_frame,
+    summarize_trades,
+)
 
 scan_universe = screener_scanner.scan_universe
 scan_universe_history = getattr(screener_scanner, "scan_universe_history", screener_scanner.scan_universe)
@@ -783,6 +790,63 @@ def main() -> None:
                 step=100,
             )
 
+        with st.expander("Strategy Lab (experimental)"):
+            st.caption(
+                "Rule-based buy/sell experiments, run independently of the divergence "
+                "scan above. Long only: buy when the entry rule turns on, sell when the "
+                "exit rule turns on."
+            )
+            strategy_choice = st.selectbox(
+                "Strategy",
+                options=["macd_zero_cross", "rsi_mtf_alignment"],
+                format_func=lambda s: {
+                    "macd_zero_cross": "MACD Zero-Cross",
+                    "rsi_mtf_alignment": "RSI Multi-Timeframe Alignment",
+                }[s],
+            )
+
+            timeframe_options = list(TIMEFRAMES.keys())
+            if strategy_choice == "macd_zero_cross":
+                st.caption(
+                    "Entry: MACD line above 0. Exit: MACD histogram turns negative "
+                    "(the same moment the MACD line crosses back below its signal line)."
+                )
+                macd_strategy_timeframe = st.selectbox(
+                    "Timeframe",
+                    options=timeframe_options,
+                    index=timeframe_options.index("1d") if "1d" in timeframe_options else 0,
+                    key="macd_strategy_timeframe",
+                )
+            else:
+                st.caption(
+                    "Entry: a higher timeframe's RSI is overbought while the execution "
+                    "timeframe's RSI is oversold. Exit: once execution-timeframe RSI has "
+                    "gone overbought too, it fades back below that threshold."
+                )
+                exec_timeframe = st.selectbox(
+                    "Execution timeframe",
+                    options=timeframe_options,
+                    index=timeframe_options.index("4h") if "4h" in timeframe_options else 0,
+                    key="rsi_mtf_exec_timeframe",
+                )
+                higher_timeframe_options = [tf for tf in timeframe_options if tf != exec_timeframe]
+                default_higher = [tf for tf in ["1d", "1w"] if tf in higher_timeframe_options][:1]
+                higher_timeframes = st.multiselect(
+                    "Higher timeframe(s) for overbought context",
+                    options=higher_timeframe_options,
+                    default=default_higher,
+                    key="rsi_mtf_higher_timeframes",
+                )
+                higher_entry_thresh = st.number_input(
+                    "Higher TF overbought threshold", min_value=50.0, max_value=95.0, value=70.0, step=1.0
+                )
+                exec_entry_thresh = st.number_input(
+                    "Execution TF oversold entry threshold", min_value=5.0, max_value=50.0, value=30.0, step=1.0
+                )
+                exec_exit_thresh = st.number_input(
+                    "Execution TF exit threshold", min_value=50.0, max_value=95.0, value=70.0, step=1.0
+                )
+
         with st.expander("Cache Management"):
             if st.button("Clear price cache"):
                 _load_price_cached.clear()
@@ -833,6 +897,9 @@ def main() -> None:
         st.session_state.scan_history_results = pd.DataFrame()
         st.session_state.scan_backtest_enabled = True
         st.session_state.scan_backtest_horizon = 10
+        st.session_state.strategy_backtest_ready = False
+        st.session_state.strategy_backtest_trades = pd.DataFrame()
+        st.session_state.strategy_backtest_name = ""
 
     run_scan = st.button("Run Scan", type="primary", use_container_width=True)
 
@@ -1061,6 +1128,81 @@ def main() -> None:
             "signals, chart overlays, and a historical backtest here. (Divergence type explanations "
             "are in the sidebar under **Divergence & Indicators**.)"
         )
+
+    st.divider()
+    st.subheader("Strategy Lab Backtest (experimental)")
+    st.caption(
+        "Independent of the divergence scan above. Simulates buying on the entry rule and "
+        "selling on the exit rule, bar by bar, for the current symbol. Configure the strategy "
+        "in the sidebar under **Strategy Lab (experimental)**."
+    )
+    run_strategy_backtest = st.button("Run Strategy Backtest", use_container_width=True)
+
+    if run_strategy_backtest:
+        symbol = st.session_state.symbol_input.strip().upper()
+        if not symbol:
+            st.warning("Please provide a symbol.")
+        else:
+            try:
+                if strategy_choice == "macd_zero_cross":
+                    candles = load_price(symbol, macd_strategy_timeframe)
+                    if candles.empty:
+                        st.error(f"No market data found for '{symbol}' on {macd_strategy_timeframe}.")
+                    else:
+                        signal_frame = macd_zero_cross_signal_frame(candles)
+                        trades = backtest_macd_zero_cross(symbol, signal_frame)
+                        st.session_state.strategy_backtest_trades = trades
+                        st.session_state.strategy_backtest_name = "MACD Zero-Cross"
+                        st.session_state.strategy_backtest_ready = True
+                elif not higher_timeframes:
+                    st.warning("Pick at least one higher timeframe for the RSI multi-timeframe strategy.")
+                else:
+                    exec_candles = load_price(symbol, exec_timeframe)
+                    higher_candles_by_tf = {tf: load_price(symbol, tf) for tf in higher_timeframes}
+                    if exec_candles.empty or any(c.empty for c in higher_candles_by_tf.values()):
+                        st.error(f"No market data found for '{symbol}' on one of the selected timeframes.")
+                    else:
+                        signal_frame = rsi_mtf_signal_frame(exec_candles, higher_candles_by_tf)
+                        trades = backtest_rsi_mtf(
+                            symbol,
+                            signal_frame,
+                            higher_entry_thresh=higher_entry_thresh,
+                            exec_entry_thresh=exec_entry_thresh,
+                            exec_exit_thresh=exec_exit_thresh,
+                        )
+                        st.session_state.strategy_backtest_trades = trades
+                        st.session_state.strategy_backtest_name = "RSI Multi-Timeframe Alignment"
+                        st.session_state.strategy_backtest_ready = True
+            except Exception as exc:
+                st.error("Something went wrong while running the strategy backtest.")
+                with st.expander("Technical details"):
+                    st.code(str(exc))
+
+    if st.session_state.strategy_backtest_ready:
+        trades = st.session_state.strategy_backtest_trades
+        st.caption(f"Strategy: {st.session_state.strategy_backtest_name}")
+        if trades.empty:
+            st.info(
+                "No completed round-trip trades for this symbol/timeframe/parameters. A position "
+                "still open at the end of price history is not counted as a trade."
+            )
+        else:
+            summary = summarize_trades(trades)
+            st.dataframe(_pretty_dataframe(summary), width="stretch")
+            st.caption(
+                "Entry and exit both fill on the close of the bar *after* the rule condition is "
+                "met - the condition is only known once the triggering bar has closed. Only "
+                "completed round trips are shown; a position still open at the end of price "
+                "history is excluded."
+            )
+            pretty_trades = _pretty_dataframe(_format_pct_values(_format_currency_values(trades)))
+            st.dataframe(pretty_trades, width="stretch")
+            st.download_button(
+                "Download strategy trades as CSV",
+                data=pretty_trades.to_csv(index=False).encode("utf-8"),
+                file_name=f"{trades['symbol'].iloc[0]}_strategy_trades.csv",
+                mime="text/csv",
+            )
 
 
 if __name__ == "__main__":
