@@ -48,23 +48,85 @@ from .indicators import (
 # ---------------------------------------------------------------------------
 
 
+def _confirmed_below_zero(series: pd.Series, confirm_bars: int) -> pd.Series:
+    """True only once `series` has stayed negative for confirm_bars consecutive
+    bars. A single negative bar fires constantly inside a healthy trend (momentum
+    decelerating isn't the same as reversing), so exiting on the first one mostly
+    buys whipsaw; a short confirmation run trades a little exit lag for far fewer
+    premature stop-outs."""
+    below = (series < 0).astype(int)
+    confirmed = below.rolling(window=confirm_bars, min_periods=confirm_bars).min()
+    # The first confirm_bars-1 rows have no full window yet (NaN) - not-yet-decided
+    # reads as "no confirmed exit", not the NaN-is-truthy default astype(bool) would give.
+    return confirmed.fillna(0).astype(bool)
+
+
 def macd_zero_cross_signal_frame(
     candles: pd.DataFrame,
     *,
     fast: int = MACD_FAST,
     slow: int = MACD_SLOW,
     signal: int = MACD_SIGNAL,
+    exit_confirm_bars: int = 2,
 ) -> pd.DataFrame:
-    """Entry: MACD line above 0. Exit: MACD histogram negative.
-
-    MACD histogram = MACD line - signal line, so "histogram goes negative" and
-    "MACD line crosses below its signal line" are the same event - one exit rule.
-    """
+    """Entry: MACD line above 0. Exit: MACD histogram negative for
+    exit_confirm_bars consecutive bars (see _confirmed_below_zero)."""
     macd = compute_macd(candles["close"], fast=fast, slow=slow, signal=signal)
     frame = pd.DataFrame({"close": candles["close"]}).join(macd)
     frame = frame.dropna(subset=["macd", "macd_signal", "macd_hist"])
     frame["entry_signal"] = frame["macd"] > 0
-    frame["exit_signal"] = frame["macd_hist"] < 0
+    frame["exit_signal"] = _confirmed_below_zero(frame["macd_hist"], exit_confirm_bars)
+    return frame
+
+
+def macd_zero_cross_golden_gated_signal_frame(
+    exec_candles: pd.DataFrame,
+    higher_candles_by_tf: dict[str, pd.DataFrame],
+    *,
+    fast: int = MACD_FAST,
+    slow: int = MACD_SLOW,
+    signal: int = MACD_SIGNAL,
+    sma_fast_period: int = 50,
+    sma_slow_period: int = 200,
+    adx_period: int = ADX_PERIOD,
+    adx_entry_thresh: float = 25.0,
+    exit_confirm_bars: int = 2,
+) -> pd.DataFrame:
+    """Entry: MACD line (execution timeframe) above 0, same as plain MACD
+    Zero-Cross, but only while at least one higher timeframe is in a golden-cross
+    regime *with ADX confirming an actual trend* (SMA50 > SMA200 AND ADX > 25
+    there) - a raw SMA cross alone stays "golden" long after the trend that
+    caused it has already died, so ADX is required to call it a live regime, not
+    just a stale cross. If every selected higher timeframe fails that bar, no
+    buys, even if MACD pokes above 0. Exit: MACD histogram negative for
+    exit_confirm_bars consecutive bars on the execution timeframe, ungated - a
+    trade still closes on its own rule even if every higher timeframe flips to a
+    death cross mid-trade.
+    """
+    close = exec_candles["close"]
+    macd = compute_macd(close, fast=fast, slow=slow, signal=signal)
+    frame = pd.DataFrame({"close": close}).join(macd)
+    frame = frame.dropna(subset=["macd", "macd_signal", "macd_hist"])
+
+    golden_cols: list[str] = []
+    for tf, higher_candles in higher_candles_by_tf.items():
+        higher_close = higher_candles["close"]
+        higher_fast = compute_sma(higher_close, period=sma_fast_period)
+        higher_slow = compute_sma(higher_close, period=sma_slow_period)
+        higher_adx = compute_adx(
+            higher_candles["high"], higher_candles["low"], higher_close, period=adx_period
+        )["adx"]
+        golden = ((higher_fast > higher_slow) & (higher_adx > adx_entry_thresh)).astype(float)
+        golden[higher_fast.isna() | higher_slow.isna() | higher_adx.isna()] = float("nan")
+        col = f"golden_cross_{tf}"
+        # NaN (regime not yet known on that higher timeframe) reads as "not golden",
+        # the same conservative default as any other timeframe not yet in a golden cross.
+        frame[col] = _asof_align(frame.index, golden) > 0.5
+        golden_cols.append(col)
+
+    frame["golden_cross_any"] = frame[golden_cols].any(axis=1)
+    frame["entry_signal"] = (frame["macd"] > 0) & frame["golden_cross_any"]
+    frame["exit_signal"] = _confirmed_below_zero(frame["macd_hist"], exit_confirm_bars)
     return frame
 
 
@@ -265,10 +327,17 @@ def _make_trade_row(
     entry_i: int,
     exit_i: int,
     exit_reason: str,
+    *,
+    cost_bps: float = 0.0,
 ) -> dict[str, object]:
+    """cost_bps is a flat round-trip cost (spread + slippage + commission), in basis
+    points of trade value, subtracted from the gross return - a rough stand-in for
+    the two fills a real broker would charge that this bar-close backtest can't see.
+    """
     entry_price = float(frame.iloc[entry_i]["close"])
     exit_price = float(frame.iloc[exit_i]["close"])
-    return_pct = ((exit_price / entry_price) - 1.0) * 100.0
+    gross_return_pct = ((exit_price / entry_price) - 1.0) * 100.0
+    return_pct = gross_return_pct - (cost_bps / 100.0)
     return {
         "symbol": symbol,
         "strategy": strategy,
@@ -278,6 +347,7 @@ def _make_trade_row(
         "exit_price": exit_price,
         "exit_reason": exit_reason,
         "bars_held": exit_i - entry_i,
+        "gross_return_pct": gross_return_pct,
         "return_pct": return_pct,
         "win": return_pct > 0,
     }
@@ -290,6 +360,7 @@ def _run_signal_backtest(
     exit_reason: str,
     *,
     atr_trailing_stop_multiplier: float | None = None,
+    cost_bps: float = 0.0,
 ) -> pd.DataFrame:
     """Long only. A signal is only known once its bar has closed, so both entry
     and exit fill on the close of the bar *after* the condition first holds true.
@@ -297,6 +368,9 @@ def _run_signal_backtest(
     If atr_trailing_stop_multiplier is set (and frame has an "atr" column), a
     chandelier-style stop also closes the trade the bar after price closes below
     (highest close since entry - multiplier * ATR), whichever exit fires first.
+
+    cost_bps is a flat round-trip cost in basis points, deducted from each trade's
+    return - see _make_trade_row.
     """
     use_trailing_stop = atr_trailing_stop_multiplier is not None and "atr" in frame.columns
     trades: list[dict[str, object]] = []
@@ -322,7 +396,7 @@ def _run_signal_backtest(
         if stop_hit or rule_exit:
             exit_i = i + 1
             reason = exit_reason if rule_exit else "atr_trailing_stop"
-            trades.append(_make_trade_row(symbol, strategy, frame, entry_i, exit_i, reason))
+            trades.append(_make_trade_row(symbol, strategy, frame, entry_i, exit_i, reason, cost_bps=cost_bps))
             in_position = False
 
     return pd.DataFrame(trades)
@@ -330,6 +404,12 @@ def _run_signal_backtest(
 
 def backtest_macd_zero_cross(symbol: str, signal_frame: pd.DataFrame, **kwargs) -> pd.DataFrame:
     return _run_signal_backtest(symbol, "macd_zero_cross", signal_frame, "macd_hist_negative", **kwargs)
+
+
+def backtest_macd_zero_cross_golden_gated(symbol: str, signal_frame: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    return _run_signal_backtest(
+        symbol, "macd_zero_cross_golden_gated", signal_frame, "macd_hist_negative", **kwargs
+    )
 
 
 def backtest_bollinger_breakout(symbol: str, signal_frame: pd.DataFrame, **kwargs) -> pd.DataFrame:
@@ -364,10 +444,15 @@ def backtest_rsi_mtf(
     exec_entry_thresh: float = 30.0,
     exec_exit_thresh: float = 70.0,
     atr_trailing_stop_multiplier: float | None = None,
+    cost_bps: float = 0.0,
 ) -> pd.DataFrame:
     """Long only. Exit only arms once execution-timeframe RSI has actually gone
     overbought post-entry, then fires the first time it fades back below that
-    threshold - a raw RSI < 70 check alone would exit on the very next dip."""
+    threshold - a raw RSI < 70 check alone would exit on the very next dip.
+
+    cost_bps is a flat round-trip cost in basis points, deducted from each trade's
+    return - see _make_trade_row.
+    """
     use_trailing_stop = atr_trailing_stop_multiplier is not None and "atr" in signal_frame.columns
     trades: list[dict[str, object]] = []
     in_position = False
@@ -398,7 +483,9 @@ def backtest_rsi_mtf(
             exit_i = i + 1
             reason = "rsi_faded_below_exit_thresh" if rule_exit else "atr_trailing_stop"
             trades.append(
-                _make_trade_row(symbol, "rsi_mtf_alignment", signal_frame, entry_i, exit_i, reason)
+                _make_trade_row(
+                    symbol, "rsi_mtf_alignment", signal_frame, entry_i, exit_i, reason, cost_bps=cost_bps
+                )
             )
             in_position = False
             armed = False
@@ -415,10 +502,14 @@ def summarize_trades(trades: pd.DataFrame) -> pd.DataFrame:
                     "win_rate_pct": None,
                     "avg_return_pct": None,
                     "median_return_pct": None,
+                    "avg_gross_return_pct": None,
                     "avg_bars_held": None,
                 }
             ]
         )
+    # gross_return_pct (pre-cost) only exists on trades produced after cost modeling was
+    # added - fall back to the net return so older/hand-built trade frames still work.
+    gross_return = trades["gross_return_pct"] if "gross_return_pct" in trades.columns else trades["return_pct"]
     return pd.DataFrame(
         [
             {
@@ -426,6 +517,7 @@ def summarize_trades(trades: pd.DataFrame) -> pd.DataFrame:
                 "win_rate_pct": round(trades["win"].mean() * 100.0, 2),
                 "avg_return_pct": round(trades["return_pct"].mean(), 2),
                 "median_return_pct": round(trades["return_pct"].median(), 2),
+                "avg_gross_return_pct": round(gross_return.mean(), 2),
                 "avg_bars_held": round(trades["bars_held"].mean(), 1),
             }
         ]

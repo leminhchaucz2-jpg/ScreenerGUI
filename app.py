@@ -28,6 +28,7 @@ from screener.config import (
     RSI_PERIOD,
     TIMEFRAMES,
     TIMEFRAME_SCAN_RULES,
+    TIMEFRAME_WEIGHTS,
     USE_ADJUSTED_PRICES,
     USE_MA_REGIME_FILTER,
     USE_STRICT_INDICATOR_PIVOTS,
@@ -42,6 +43,7 @@ from screener.strategies import (
     backtest_di_crossover,
     backtest_golden_cross_trend,
     backtest_macd_zero_cross,
+    backtest_macd_zero_cross_golden_gated,
     backtest_rsi_mtf,
     backtest_stoch_rsi_swing,
     backtest_volume_confirmed_breakout,
@@ -49,6 +51,7 @@ from screener.strategies import (
     cci_extreme_reversal_signal_frame,
     di_crossover_signal_frame,
     golden_cross_trend_signal_frame,
+    macd_zero_cross_golden_gated_signal_frame,
     macd_zero_cross_signal_frame,
     rsi_mtf_signal_frame,
     stoch_rsi_swing_signal_frame,
@@ -70,14 +73,17 @@ compute_sma = getattr(
 )
 
 # Single-timeframe strategies for the Strategy Lab: each needs only one symbol +
-# one timeframe of candles, unlike RSI Multi-Timeframe Alignment which pulls in
-# an extra higher-timeframe series and gets its own UI branch below.
+# one timeframe of candles, unlike the multi-timeframe strategies (RSI Multi-
+# Timeframe Alignment, MACD Zero-Cross Golden Cross Gated) which pull in an
+# extra higher-timeframe series each and get their own UI branches below.
 SINGLE_TIMEFRAME_STRATEGIES: dict[str, dict[str, object]] = {
     "macd_zero_cross": {
         "label": "MACD Zero-Cross",
         "caption": (
-            "Entry: MACD line above 0. Exit: MACD histogram turns negative "
-            "(the same moment the MACD line crosses back below its signal line)."
+            "Entry: MACD line above 0. Exit: MACD histogram negative for 2 "
+            "consecutive bars (the histogram crossing below its signal line once "
+            "is common inside a healthy trend; requiring a short run avoids "
+            "exiting on that first wobble)."
         ),
         "default_timeframe": "1d",
         "signal_frame_fn": macd_zero_cross_signal_frame,
@@ -886,10 +892,14 @@ def main() -> None:
                 "scan above. Long only: buy when the entry rule turns on, sell when the "
                 "exit rule turns on."
             )
-            strategy_options = list(SINGLE_TIMEFRAME_STRATEGIES.keys()) + ["rsi_mtf_alignment"]
+            strategy_options = list(SINGLE_TIMEFRAME_STRATEGIES.keys()) + [
+                "macd_zero_cross_golden_gated",
+                "rsi_mtf_alignment",
+            ]
             strategy_labels = {
                 key: conf["label"] for key, conf in SINGLE_TIMEFRAME_STRATEGIES.items()
             }
+            strategy_labels["macd_zero_cross_golden_gated"] = "MACD Zero-Cross (Golden Cross Gated)"
             strategy_labels["rsi_mtf_alignment"] = "RSI Multi-Timeframe Alignment"
             strategy_choice = st.selectbox(
                 "Strategy",
@@ -907,6 +917,33 @@ def main() -> None:
                     options=timeframe_options,
                     index=timeframe_options.index(default_tf) if default_tf in timeframe_options else 0,
                     key="single_tf_strategy_timeframe",
+                )
+            elif strategy_choice == "macd_zero_cross_golden_gated":
+                st.caption(
+                    "Entry: MACD line (execution timeframe) above 0, but only while at "
+                    "least one selected higher timeframe is in a golden-cross regime "
+                    "with ADX confirming an actual trend (SMA50 > SMA200 and ADX > 25 "
+                    "there) - a raw SMA cross alone stays 'golden' long after the trend "
+                    "that caused it has died, so ADX is required too. Exit: MACD "
+                    "histogram negative for 2 consecutive bars on the execution "
+                    "timeframe, ungated - avoids exiting on a single-bar momentum wobble "
+                    "inside an otherwise healthy trend."
+                )
+                golden_exec_timeframe = st.selectbox(
+                    "Execution timeframe",
+                    options=timeframe_options,
+                    index=timeframe_options.index("1h") if "1h" in timeframe_options else 0,
+                    key="golden_gated_exec_timeframe",
+                )
+                exec_weight = TIMEFRAME_WEIGHTS.get(golden_exec_timeframe, 0)
+                golden_higher_timeframe_options = [
+                    tf for tf in timeframe_options if TIMEFRAME_WEIGHTS.get(tf, 0) > exec_weight
+                ]
+                golden_higher_timeframes = st.multiselect(
+                    "Higher timeframe(s) for golden-cross context",
+                    options=golden_higher_timeframe_options,
+                    default=golden_higher_timeframe_options,
+                    key="golden_gated_higher_timeframes",
                 )
             else:
                 st.caption(
@@ -954,6 +991,22 @@ def main() -> None:
                 )
                 if use_atr_trailing_stop
                 else None
+            )
+
+            st.caption(
+                "Round-trip cost (spread + slippage + commission), charged against every "
+                "trade as a flat percentage of trade value. This backtest fills on bar "
+                "closes with no cost otherwise, so a strategy's edge can look real purely "
+                "because it's free to trade - set this above 0 to see if it survives real "
+                "execution costs. The results table shows both the pre-cost (gross) and "
+                "cost-adjusted (net) average return so you can compare."
+            )
+            cost_bps = st.number_input(
+                "Cost per round-trip trade (bps)",
+                min_value=0.0,
+                max_value=500.0,
+                value=10.0,
+                step=1.0,
             )
 
         with st.expander("Cache Management"):
@@ -1263,11 +1316,37 @@ def main() -> None:
                         if atr_trailing_stop_multiplier is not None:
                             signal_frame = add_atr_column(candles, signal_frame)
                         trades = strategy_conf["backtest_fn"](
-                            symbol, signal_frame, atr_trailing_stop_multiplier=atr_trailing_stop_multiplier
+                            symbol,
+                            signal_frame,
+                            atr_trailing_stop_multiplier=atr_trailing_stop_multiplier,
+                            cost_bps=cost_bps,
                         )
                         st.session_state.strategy_backtest_trades = trades
                         st.session_state.strategy_backtest_name = strategy_conf["label"]
                         st.session_state.strategy_backtest_ready = True
+                elif strategy_choice == "macd_zero_cross_golden_gated":
+                    if not golden_higher_timeframes:
+                        st.warning("Pick at least one higher timeframe for the golden-cross gate.")
+                    else:
+                        exec_candles = load_price(symbol, golden_exec_timeframe)
+                        higher_candles_by_tf = {tf: load_price(symbol, tf) for tf in golden_higher_timeframes}
+                        if exec_candles.empty or any(c.empty for c in higher_candles_by_tf.values()):
+                            st.error(f"No market data found for '{symbol}' on one of the selected timeframes.")
+                        else:
+                            signal_frame = macd_zero_cross_golden_gated_signal_frame(
+                                exec_candles, higher_candles_by_tf
+                            )
+                            if atr_trailing_stop_multiplier is not None:
+                                signal_frame = add_atr_column(exec_candles, signal_frame)
+                            trades = backtest_macd_zero_cross_golden_gated(
+                                symbol,
+                                signal_frame,
+                                atr_trailing_stop_multiplier=atr_trailing_stop_multiplier,
+                                cost_bps=cost_bps,
+                            )
+                            st.session_state.strategy_backtest_trades = trades
+                            st.session_state.strategy_backtest_name = "MACD Zero-Cross (Golden Cross Gated)"
+                            st.session_state.strategy_backtest_ready = True
                 elif not higher_timeframes:
                     st.warning("Pick at least one higher timeframe for the RSI multi-timeframe strategy.")
                 else:
@@ -1286,6 +1365,7 @@ def main() -> None:
                             exec_entry_thresh=exec_entry_thresh,
                             exec_exit_thresh=exec_exit_thresh,
                             atr_trailing_stop_multiplier=atr_trailing_stop_multiplier,
+                            cost_bps=cost_bps,
                         )
                         st.session_state.strategy_backtest_trades = trades
                         st.session_state.strategy_backtest_name = "RSI Multi-Timeframe Alignment"

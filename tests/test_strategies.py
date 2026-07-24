@@ -37,7 +37,131 @@ def test_macd_zero_cross_signal_frame_flags_expected_columns() -> None:
 
     assert {"macd", "macd_signal", "macd_hist", "entry_signal", "exit_signal"} <= set(frame.columns)
     assert bool(frame["entry_signal"].iloc[-1])  # trend has turned firmly bullish by the end
-    assert (frame["exit_signal"] == (frame["macd_hist"] < 0)).all()
+    assert (frame["entry_signal"] == (frame["macd"] > 0)).all()
+
+
+def test_macd_zero_cross_signal_frame_exit_requires_two_consecutive_negative_bars(monkeypatch) -> None:
+    index = pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC")
+    candles = _candles(index, [10.0] * 6)
+    macd_df = pd.DataFrame(
+        {
+            "macd": [1.0] * 6,
+            "macd_signal": [0.0] * 6,
+            # A single-bar dip at index 2 is a normal wobble inside a trend and
+            # should NOT exit; only the second of two consecutive negative bars
+            # (index 4-5) confirms a real exit.
+            "macd_hist": [1.0, 1.0, -1.0, 1.0, -1.0, -1.0],
+        },
+        index=index,
+    )
+    monkeypatch.setattr(strategies, "compute_macd", lambda *a, **k: macd_df)
+
+    frame = strategies.macd_zero_cross_signal_frame(candles)
+
+    assert list(frame["exit_signal"]) == [False, False, False, False, False, True]
+
+
+def test_macd_zero_cross_golden_gated_signal_frame_blocks_entries_when_all_higher_tf_death_cross(
+    monkeypatch,
+) -> None:
+    # 12 4h-bars spanning two days: bars 0-5 fall on day 1, bars 6-11 on day 2.
+    exec_index = pd.date_range("2024-01-01", periods=12, freq="4h", tz="UTC")
+    exec_candles = _candles(exec_index, [10.0] * 12)
+
+    macd_vals = [1.0, 1.0, 1.0, 1.0, -1.0, 1.0] * 2
+    macd_hist_vals = [1.0, 1.0, 1.0, -1.0, -1.0, 1.0] * 2
+    macd_df = pd.DataFrame(
+        {"macd": macd_vals, "macd_signal": [0.0] * 12, "macd_hist": macd_hist_vals},
+        index=exec_index,
+    )
+    monkeypatch.setattr(strategies, "compute_macd", lambda *a, **k: macd_df)
+
+    # A single higher timeframe (1d): golden cross (fast > slow) on day 1, death
+    # cross on day 2. ADX confirms a real trend on both days, so the gate here
+    # turns purely on the SMA cross.
+    higher_index = pd.date_range("2024-01-01", periods=2, freq="D", tz="UTC")
+    higher_candles = _candles(higher_index, [10.0, 10.0])
+    fast_vals = pd.Series([2.0, 1.0], index=higher_index)
+    slow_vals = pd.Series([1.0, 2.0], index=higher_index)
+
+    def fake_sma(close, period):
+        return fast_vals if period == 50 else slow_vals
+
+    monkeypatch.setattr(strategies, "compute_sma", fake_sma)
+    monkeypatch.setattr(
+        strategies, "compute_adx", lambda *a, **k: pd.DataFrame({"adx": [30.0, 30.0]}, index=higher_index)
+    )
+
+    frame = strategies.macd_zero_cross_golden_gated_signal_frame(exec_candles, {"1d": higher_candles})
+
+    # Bars 0-5 (day 1) see the golden cross so entry tracks MACD > 0 there; bars
+    # 6-11 (day 2) see the death cross, so no entries at all regardless of MACD.
+    assert list(frame["entry_signal"]) == [True, True, True, True, False, True, False, False, False, False, False, False]
+    # Exit requires 2 consecutive negative-histogram bars: the second bar of each
+    # negative pair (indices 4 and 10) confirms, not the first (indices 3 and 9).
+    assert list(frame["exit_signal"]) == [False, False, False, False, True, False] * 2
+
+
+def test_macd_zero_cross_golden_gated_signal_frame_any_higher_tf_golden_cross_is_enough(
+    monkeypatch,
+) -> None:
+    exec_index = pd.date_range("2024-01-01", periods=2, freq="4h", tz="UTC")
+    exec_candles = _candles(exec_index, [10.0, 10.0])
+
+    macd_df = pd.DataFrame(
+        {"macd": [1.0, 1.0], "macd_signal": [0.0, 0.0], "macd_hist": [1.0, 1.0]},
+        index=exec_index,
+    )
+    monkeypatch.setattr(strategies, "compute_macd", lambda *a, **k: macd_df)
+
+    higher_index = pd.date_range("2024-01-01", periods=1, freq="D", tz="UTC")
+    death_cross_tf = _candles(higher_index, [10.0])
+    golden_cross_tf = _candles(higher_index, [10.0])
+
+    def fake_sma(close, period):
+        # Distinguish the two higher timeframes by identity of the close series.
+        if close is death_cross_tf["close"]:
+            return pd.Series([1.0], index=higher_index) if period == 50 else pd.Series([2.0], index=higher_index)
+        return pd.Series([2.0], index=higher_index) if period == 50 else pd.Series([1.0], index=higher_index)
+
+    monkeypatch.setattr(strategies, "compute_sma", fake_sma)
+    # ADX confirms a real trend on both higher timeframes, so this test isolates
+    # the "any higher timeframe golden" OR logic from the ADX gate.
+    monkeypatch.setattr(strategies, "compute_adx", lambda *a, **k: pd.DataFrame({"adx": [30.0]}, index=higher_index))
+
+    frame = strategies.macd_zero_cross_golden_gated_signal_frame(
+        exec_candles, {"1d": death_cross_tf, "1w": golden_cross_tf}
+    )
+
+    # 1d is in a death cross but 1w is in a golden cross - one is enough to gate the entry on.
+    assert bool(frame["entry_signal"].iloc[0])
+
+
+def test_macd_zero_cross_golden_gated_signal_frame_requires_adx_confirmation(monkeypatch) -> None:
+    # Two exec bars, one per higher-tf day: SMA is golden on both days, but ADX
+    # only confirms a real trend on day 2 - day 1's cross is stale/weak and should
+    # NOT gate an entry despite technically being a golden cross.
+    exec_index = pd.date_range("2024-01-01", periods=2, freq="1D", tz="UTC")
+    exec_candles = _candles(exec_index, [10.0, 10.0])
+
+    macd_df = pd.DataFrame(
+        {"macd": [1.0, 1.0], "macd_signal": [0.0, 0.0], "macd_hist": [1.0, 1.0]},
+        index=exec_index,
+    )
+    monkeypatch.setattr(strategies, "compute_macd", lambda *a, **k: macd_df)
+
+    higher_index = pd.date_range("2024-01-01", periods=2, freq="D", tz="UTC")
+    higher_candles = _candles(higher_index, [10.0, 10.0])
+    fast_vals = pd.Series([2.0, 2.0], index=higher_index)  # golden (fast > slow) both days
+    slow_vals = pd.Series([1.0, 1.0], index=higher_index)
+    adx_vals = pd.DataFrame({"adx": [10.0, 30.0]}, index=higher_index)  # weak, then confirmed
+
+    monkeypatch.setattr(strategies, "compute_sma", lambda close, period: fast_vals if period == 50 else slow_vals)
+    monkeypatch.setattr(strategies, "compute_adx", lambda *a, **k: adx_vals)
+
+    frame = strategies.macd_zero_cross_golden_gated_signal_frame(exec_candles, {"1d": higher_candles})
+
+    assert list(frame["entry_signal"]) == [False, True]
 
 
 def test_backtest_macd_zero_cross_fills_one_bar_after_signal() -> None:
@@ -62,8 +186,40 @@ def test_backtest_macd_zero_cross_fills_one_bar_after_signal() -> None:
     assert row["exit_time"] == index[4]
     assert row["exit_price"] == pytest.approx(14.0)
     assert row["bars_held"] == 2
-    assert row["return_pct"] == pytest.approx(((14.0 / 12.0) - 1.0) * 100.0)
+    gross_return_pct = ((14.0 / 12.0) - 1.0) * 100.0
+    assert row["gross_return_pct"] == pytest.approx(gross_return_pct)
+    assert row["return_pct"] == pytest.approx(gross_return_pct)  # cost_bps defaults to 0
     assert row["win"]
+
+
+def test_backtest_macd_zero_cross_deducts_round_trip_cost_from_net_return_only() -> None:
+    index = pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC")
+    close = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+    frame = pd.DataFrame(
+        {
+            "close": close,
+            "entry_signal": [False, True, False, False, False, False],
+            "exit_signal": [False, False, False, True, False, False],
+        },
+        index=index,
+    )
+
+    trades = backtest_macd_zero_cross("TEST", frame, cost_bps=50.0)
+
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    gross_return_pct = ((14.0 / 12.0) - 1.0) * 100.0
+    # gross_return_pct is untouched by cost; return_pct (net) has 50bps = 0.50
+    # percentage points of round-trip cost subtracted from it.
+    assert row["gross_return_pct"] == pytest.approx(gross_return_pct)
+    assert row["return_pct"] == pytest.approx(gross_return_pct - 0.50)
+    assert row["win"]  # still a net win once cost is deducted
+
+    trades_high_cost = backtest_macd_zero_cross("TEST", frame, cost_bps=2000.0)
+    row_high_cost = trades_high_cost.iloc[0]
+    # A big enough cost can flip a gross winner into a net loser.
+    assert row_high_cost["gross_return_pct"] == pytest.approx(gross_return_pct)
+    assert not row_high_cost["win"]
 
 
 def test_backtest_macd_zero_cross_drops_position_still_open_at_end() -> None:
@@ -278,6 +434,8 @@ def test_summarize_trades_handles_empty_and_populated() -> None:
     empty_summary = summarize_trades(pd.DataFrame())
     assert empty_summary.iloc[0]["trades"] == 0
 
+    # Without a gross_return_pct column (older/hand-built trade frames), gross falls
+    # back to the net return.
     trades = pd.DataFrame(
         [
             {"return_pct": 5.0, "win": True, "bars_held": 2},
@@ -289,4 +447,18 @@ def test_summarize_trades_handles_empty_and_populated() -> None:
     assert row["trades"] == 2
     assert row["win_rate_pct"] == pytest.approx(50.0)
     assert row["avg_return_pct"] == pytest.approx(2.0)
+    assert row["avg_gross_return_pct"] == pytest.approx(2.0)
     assert row["avg_bars_held"] == pytest.approx(3.0)
+
+    # With gross_return_pct present (real backtest output), net and gross diverge
+    # by the cost that was deducted per trade.
+    trades_with_cost = pd.DataFrame(
+        [
+            {"gross_return_pct": 5.5, "return_pct": 5.0, "win": True, "bars_held": 2},
+            {"gross_return_pct": -0.5, "return_pct": -1.0, "win": False, "bars_held": 4},
+        ]
+    )
+    summary_with_cost = summarize_trades(trades_with_cost)
+    row_with_cost = summary_with_cost.iloc[0]
+    assert row_with_cost["avg_return_pct"] == pytest.approx(2.0)
+    assert row_with_cost["avg_gross_return_pct"] == pytest.approx(2.5)
